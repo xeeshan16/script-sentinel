@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sentinel
+          POSTGRES_PASSWORD: sentinel
+          POSTGRES_DB: sentinel
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sentinel"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Runs the SQLite tests plus the same suite against real PostgreSQL.
+      SENTINEL_TEST_DATABASE_URL: postgresql+asyncpg://sentinel:sentinel@localhost:5432/sentinel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Test
+        run: uv run pytest --cov --cov-report=term --cov-fail-under=95
+
+      - name: Build
+        run: uv build
+
+      - name: Smoke test the CLI and API against PostgreSQL
+        env:
+          SENTINEL_DATABASE_URL: ${{ env.SENTINEL_TEST_DATABASE_URL }}
+        run: |
+          .venv/bin/sentinel db downgrade base
+          .venv/bin/sentinel db upgrade
+          .venv/bin/sentinel sites add shop --origin https://shop.example.com
+          .venv/bin/sentinel pages add shop https://shop.example.com/checkout --payment
+          # A page off the allowlist is refused with exit code 2.
+          set +e
+          .venv/bin/sentinel pages add shop https://cdn.vendor.test/
+          test $? -eq 2
+          set -e
+          .venv/bin/sentinel sites list --json | jq -e '.[0].payment_pages == 1'
+          # Run the installed entry point directly and stop it on exit, so no server
+          # outlives the step while holding uv's cache lock.
+          .venv/bin/sentinel serve --port 8080 &
+          server=$!
+          trap 'kill "$server"' EXIT
+          for _ in $(seq 1 30); do curl -sf localhost:8080/readyz && break; sleep 1; done
+          curl -sf localhost:8080/readyz | jq -e '.database == "ok"'
+          curl -sf localhost:8080/v1/sites/shop | jq -e '.page_count == 1'
+          curl -sf -X POST localhost:8080/v1/sites -H 'content-type: application/json' \
+            -d '{"name": "blog", "allowed_origins": ["https://Blog.Example.com:443/"]}' \
+            | jq -e '.allowed_origins == ["https://blog.example.com"] and .scan_interval_hours == 168'
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8080/v1/sites/blog/pages \
+            -H 'content-type: application/json' -d '{"url": "https://evil.test/"}')
+          test "$status" = 422
