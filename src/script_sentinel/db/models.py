@@ -10,6 +10,10 @@
   A script that changes on the vendor's CDN gets a new version.
 * A **finding** is something a person should look at: an unapproved script, a changed
   body, a suspicious pattern.
+* A **scan** is one pass over a site's pages. Each page it fetched gets a **page
+  snapshot** (what happened and when), and each script found on that page gets a **script
+  observation** with the attributes it had at that moment. Snapshots are kept even after a
+  page is removed, because they are the evidence that a check ran.
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     Uuid,
+    true,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Dialect
@@ -95,7 +100,44 @@ class FindingStatus(enum.StrEnum):
     RESOLVED = "resolved"
 
 
-def _enum(cls: type[enum.StrEnum], name: str) -> Enum:
+class ScanStatus(enum.StrEnum):
+    RUNNING = "running"
+    COMPLETED = "completed"  # every page was inventoried or skipped by robots.txt
+    PARTIAL = "partial"  # some pages failed
+    FAILED = "failed"  # no page could be inventoried
+
+
+class ScanTrigger(enum.StrEnum):
+    CLI = "cli"
+    API = "api"
+    SCHEDULE = "schedule"
+
+
+class SnapshotOutcome(enum.StrEnum):
+    OK = "ok"
+    ROBOTS_DISALLOWED = "robots_disallowed"
+    REDIRECT_BLOCKED = "redirect_blocked"
+    HTTP_ERROR = "http_error"
+    NOT_HTML = "not_html"
+    TOO_LARGE = "too_large"
+    FETCH_ERROR = "fetch_error"
+
+    @property
+    def failed(self) -> bool:
+        """Whether the page couldn't be inventoried for a reason someone should fix.
+
+        A robots.txt refusal is a decision the site made, not a failure.
+        """
+        return self not in (SnapshotOutcome.OK, SnapshotOutcome.ROBOTS_DISALLOWED)
+
+
+class ScriptType(enum.StrEnum):
+    CLASSIC = "classic"
+    MODULE = "module"
+    IMPORTMAP = "importmap"
+
+
+def _enum(cls: type[enum.StrEnum], name: str, length: int = 16) -> Enum:
     # VARCHAR plus a CHECK constraint: portable, and adding a value later is a plain
     # constraint change rather than an ALTER TYPE.
     return Enum(
@@ -103,7 +145,7 @@ def _enum(cls: type[enum.StrEnum], name: str) -> Enum:
         name=name,
         native_enum=False,
         create_constraint=True,
-        length=16,
+        length=length,
         values_callable=lambda members: [m.value for m in members],
     )
 
@@ -139,6 +181,7 @@ class Site(Base):
     name: Mapped[str] = mapped_column(String(64), unique=True)
     allowed_origins: Mapped[list[str]]
     scan_interval_hours: Mapped[int] = mapped_column(Integer)
+    respect_robots: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
@@ -237,6 +280,98 @@ class Finding(Base):
     detail: Mapped[dict[str, Any]] = mapped_column(default=dict)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     resolved_at: Mapped[datetime | None]
+
+
+class Scan(Base):
+    __tablename__ = "scans"
+    __table_args__ = (Index("ix_scans_site_started", "site_id", "started_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    site_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"))
+    status: Mapped[ScanStatus] = mapped_column(_enum(ScanStatus, "scan_status"))
+    trigger: Mapped[ScanTrigger] = mapped_column(_enum(ScanTrigger, "scan_trigger"))
+    started_at: Mapped[datetime] = mapped_column(default=utcnow)
+    finished_at: Mapped[datetime | None]
+    pages_total: Mapped[int] = mapped_column(Integer, default=0)
+    pages_ok: Mapped[int] = mapped_column(Integer, default=0)
+    pages_skipped: Mapped[int] = mapped_column(Integer, default=0)
+    pages_failed: Mapped[int] = mapped_column(Integer, default=0)
+    scripts_seen: Mapped[int] = mapped_column(Integer, default=0)
+    scripts_new: Mapped[int] = mapped_column(Integer, default=0)
+
+    snapshots: Mapped[list[PageSnapshot]] = relationship(
+        back_populates="scan",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="PageSnapshot.url",
+    )
+
+
+class PageSnapshot(Base):
+    """What one scan saw on one page."""
+
+    __tablename__ = "page_snapshots"
+    __table_args__ = (Index("ix_page_snapshots_page_fetched", "page_id", "fetched_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    scan_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"))
+    # SET NULL: the snapshot stays as evidence after the page is unregistered.
+    page_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("pages.id", ondelete="SET NULL"))
+    url: Mapped[str] = mapped_column(String(2048))
+    payment_page: Mapped[bool] = mapped_column(Boolean, default=False)
+    outcome: Mapped[SnapshotOutcome] = mapped_column(_enum(SnapshotOutcome, "snapshot_outcome", 32))
+    final_url: Mapped[str | None] = mapped_column(String(2048))
+    http_status: Mapped[int | None] = mapped_column(Integer)
+    content_type: Mapped[str | None] = mapped_column(String(255))
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
+    body_sha384: Mapped[str | None] = mapped_column(String(96))
+    elapsed_ms: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(String(1024))
+    warnings: Mapped[list[str]] = mapped_column(default=list)
+    script_count: Mapped[int] = mapped_column(Integer, default=0)
+    data_block_count: Mapped[int] = mapped_column(Integer, default=0)
+    fetched_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    scan: Mapped[Scan] = relationship(back_populates="snapshots")
+    observations: Mapped[list[ScriptObservation]] = relationship(
+        back_populates="snapshot",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="ScriptObservation.position",
+    )
+
+
+class ScriptObservation(Base):
+    """One script as it appeared on one page in one scan."""
+
+    __tablename__ = "script_observations"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "position", name="uq_script_observations_snapshot_pos"),
+        Index("ix_script_observations_script_id", "script_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("page_snapshots.id", ondelete="CASCADE")
+    )
+    script_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("scripts.id", ondelete="CASCADE"))
+    position: Mapped[int] = mapped_column(Integer)
+    script_type: Mapped[ScriptType] = mapped_column(_enum(ScriptType, "script_type"))
+    type_attribute: Mapped[str | None] = mapped_column(String(128))
+    integrity: Mapped[str | None] = mapped_column(String(1024))
+    crossorigin: Mapped[str | None] = mapped_column(String(32))
+    referrerpolicy: Mapped[str | None] = mapped_column(String(64))
+    # A short digest, never the nonce itself; enough to spot a nonce that never changes.
+    nonce_digest: Mapped[str | None] = mapped_column(String(16))
+    is_async: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_defer: Mapped[bool] = mapped_column(Boolean, default=False)
+    nomodule: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Inline scripts: the body's SHA-384 and size (external bodies are fetched on day 3).
+    inline_sha384: Mapped[str | None] = mapped_column(String(96))
+    inline_size_bytes: Mapped[int | None] = mapped_column(Integer)
+
+    snapshot: Mapped[PageSnapshot] = relationship(back_populates="observations")
+    script: Mapped[Script] = relationship()
 
 
 def sri_from_sha384_hex(hex_digest: str) -> str:

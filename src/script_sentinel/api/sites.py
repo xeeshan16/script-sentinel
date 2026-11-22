@@ -52,6 +52,7 @@ async def _site_out(session: AsyncSession, site: Site) -> SiteOut:
         name=site.name,
         allowed_origins=site.allowed_origins,
         scan_interval_hours=site.scan_interval_hours,
+        respect_robots=site.respect_robots,
         page_count=len(pages),
         payment_page_count=sum(p.payment_page for p in pages),
         created_at=site.created_at,
@@ -66,6 +67,7 @@ async def create_site(body: SiteCreate, session: Session, settings: AppSettings)
         name=body.name,
         allowed_origins=body.allowed_origins,
         scan_interval_hours=body.scan_interval_hours or settings.default_scan_interval_hours,
+        respect_robots=body.respect_robots,
     )
     return await _site_out(session, site)
 
@@ -79,6 +81,7 @@ async def list_sites(session: Session) -> SiteList:
                 name=s.site.name,
                 allowed_origins=s.site.allowed_origins,
                 scan_interval_hours=s.site.scan_interval_hours,
+                respect_robots=s.site.respect_robots,
                 page_count=s.page_count,
                 payment_page_count=s.payment_page_count,
                 created_at=s.site.created_at,
@@ -101,6 +104,7 @@ async def update_site(name: str, body: SiteUpdate, session: Session) -> SiteOut:
         name,
         allowed_origins=body.allowed_origins,
         scan_interval_hours=body.scan_interval_hours,
+        respect_robots=body.respect_robots,
     )
     return await _site_out(session, site)
 

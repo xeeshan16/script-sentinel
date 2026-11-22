@@ -8,6 +8,14 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 from script_sentinel.config import MAX_SCAN_INTERVAL_HOURS
+from script_sentinel.db.models import (
+    AuthorizationStatus,
+    ScanStatus,
+    ScanTrigger,
+    ScriptKind,
+    ScriptType,
+    SnapshotOutcome,
+)
 
 
 class SiteCreate(BaseModel):
@@ -23,6 +31,11 @@ class SiteCreate(BaseModel):
         le=MAX_SCAN_INTERVAL_HOURS,
         description="Defaults to SENTINEL_DEFAULT_SCAN_INTERVAL_HOURS.",
     )
+    respect_robots: bool = Field(
+        default=True,
+        description="Ask each origin's robots.txt before fetching. Turn off for your own "
+        "pages that robots.txt disallows for crawlers (checkout pages often are).",
+    )
 
 
 class SiteUpdate(BaseModel):
@@ -30,6 +43,7 @@ class SiteUpdate(BaseModel):
 
     allowed_origins: list[str] | None = Field(default=None, min_length=1, max_length=50)
     scan_interval_hours: int | None = Field(default=None, ge=1, le=MAX_SCAN_INTERVAL_HOURS)
+    respect_robots: bool | None = None
 
 
 class SiteOut(BaseModel):
@@ -37,6 +51,7 @@ class SiteOut(BaseModel):
     name: str
     allowed_origins: list[str]
     scan_interval_hours: int
+    respect_robots: bool
     page_count: int
     payment_page_count: int
     created_at: datetime
@@ -72,3 +87,81 @@ class PageList(BaseModel):
 
 class ErrorOut(BaseModel):
     detail: str
+
+
+class ScanOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    status: ScanStatus
+    trigger: ScanTrigger
+    started_at: datetime
+    finished_at: datetime | None
+    pages_total: int
+    pages_ok: int
+    pages_skipped: int
+    pages_failed: int
+    scripts_seen: int
+    scripts_new: int
+
+
+class ScanList(BaseModel):
+    site: str
+    scans: list[ScanOut]
+
+
+class ObservationOut(BaseModel):
+    position: int
+    script_id: uuid.UUID
+    kind: ScriptKind
+    locator: str
+    script_type: ScriptType
+    type_attribute: str | None
+    integrity: str | None
+    crossorigin: str | None
+    referrerpolicy: str | None
+    has_nonce: bool
+    is_async: bool
+    is_defer: bool
+    nomodule: bool
+    inline_sha384: str | None
+    inline_size_bytes: int | None
+
+
+class SnapshotOut(BaseModel):
+    url: str
+    payment_page: bool
+    outcome: SnapshotOutcome
+    final_url: str | None
+    http_status: int | None
+    content_type: str | None
+    size_bytes: int | None
+    body_sha384: str | None
+    elapsed_ms: int
+    error: str | None
+    warnings: list[str]
+    data_block_count: int
+    fetched_at: datetime
+    scripts: list[ObservationOut]
+
+
+class ScanDetail(ScanOut):
+    site: str
+    pages: list[SnapshotOut]
+
+
+class ScriptOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    kind: ScriptKind
+    locator: str
+    status: AuthorizationStatus
+    justification: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+
+class ScriptList(BaseModel):
+    site: str
+    scripts: list[ScriptOut]

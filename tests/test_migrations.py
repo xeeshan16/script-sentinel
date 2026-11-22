@@ -12,7 +12,16 @@ from sqlalchemy.engine import Connection
 from script_sentinel.db import make_engine, migrate
 from script_sentinel.db.models import Base
 
-TABLES = {"sites", "pages", "scripts", "script_versions", "findings"}
+TABLES = {
+    "sites",
+    "pages",
+    "scripts",
+    "script_versions",
+    "findings",
+    "scans",
+    "page_snapshots",
+    "script_observations",
+}
 
 
 def _diff(connection: Connection) -> list[Any]:
@@ -57,4 +66,4 @@ def test_upgrade_and_downgrade_round_trip(database_url: str) -> None:
 
 def test_current_prints_the_revision(sqlite_url: str, capsys: pytest.CaptureFixture[str]) -> None:
     migrate.current(sqlite_url)
-    assert "0001" in capsys.readouterr().out
+    assert "0002" in capsys.readouterr().out

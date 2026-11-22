@@ -5,14 +5,17 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from script_sentinel import __version__
+from script_sentinel.api import scans as scans_api
 from script_sentinel.api import sites as sites_api
 from script_sentinel.config import Settings
 from script_sentinel.db import make_engine, make_sessionmaker
+from script_sentinel.fetch import PageFetcher
 from script_sentinel.sites import ConflictError, NotFoundError, SiteError, ValidationError
 
 _STATUS: dict[type[SiteError], int] = {
@@ -22,8 +25,12 @@ _STATUS: dict[type[SiteError], int] = {
 }
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None, *, transport: httpx.AsyncBaseTransport | None = None
+) -> FastAPI:
+    """Build the app. ``transport`` replaces the network for page fetches (tests)."""
     settings = settings or Settings()
+    limits = settings.fetch_limits()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -42,6 +49,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    # A fresh fetcher per scan, so each scan reads robots.txt again.
+    app.state.fetcher_factory = lambda: PageFetcher(limits, transport=transport)
 
     @app.exception_handler(SiteError)
     async def _site_error(_request: Request, exc: SiteError) -> JSONResponse:
@@ -67,4 +76,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse({"status": "ok", "database": "ok"})
 
     app.include_router(sites_api.router)
+    app.include_router(scans_api.router)
     return app

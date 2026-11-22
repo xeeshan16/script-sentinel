@@ -83,11 +83,13 @@ async def create_site(
     name: str,
     allowed_origins: Sequence[str],
     scan_interval_hours: int,
+    respect_robots: bool = True,
 ) -> Site:
     site = Site(
         name=validate_site_name(name),
         allowed_origins=_origins(allowed_origins),
         scan_interval_hours=validate_scan_interval(scan_interval_hours),
+        respect_robots=respect_robots,
     )
     session.add(site)
     try:
@@ -128,6 +130,7 @@ async def update_site(
     *,
     allowed_origins: Sequence[str] | None = None,
     scan_interval_hours: int | None = None,
+    respect_robots: bool | None = None,
 ) -> Site:
     site = await get_site(session, name)
     if allowed_origins is not None:
@@ -143,6 +146,8 @@ async def update_site(
         site.allowed_origins = origins
     if scan_interval_hours is not None:
         site.scan_interval_hours = validate_scan_interval(scan_interval_hours)
+    if respect_robots is not None:
+        site.respect_robots = respect_robots
     await session.flush()
     return site
 
