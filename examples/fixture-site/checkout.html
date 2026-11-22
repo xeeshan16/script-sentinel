@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Checkout - Example Shop</title>
+  <script nonce="demo-nonce">window.checkoutConfig = {currency: "EUR", locale: "en-IE"};</script>
+  <script type="importmap">{"imports": {"payments": "/js/payments.mjs"}}</script>
+  <script src="/js/app.js" defer></script>
+  <script src="https://cdn.vendor.test/analytics/v2/tag.js" async></script>
+  <script src="https://js.payments.test/v3/elements.js"
+          integrity="sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC"
+          crossorigin="anonymous"></script>
+  <script type="module" src="/js/checkout.mjs"></script>
+  <script type="application/ld+json">{"@context": "https://schema.org", "@type": "WebPage"}</script>
+</head>
+<body>
+  <h1>Checkout</h1>
+  <form id="payment-form">
+    <div id="card-element"></div>
+    <button type="submit">Pay</button>
+  </form>
+  <noscript><p>Checkout needs JavaScript.</p></noscript>
+</body>
+</html>

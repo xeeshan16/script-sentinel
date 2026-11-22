@@ -1,0 +1,3 @@
+# Crawlers have no business on the checkout page.
+User-agent: *
+Disallow: /checkout

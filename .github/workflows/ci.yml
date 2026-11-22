@@ -93,3 +93,29 @@ jobs:
           status=$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8080/v1/sites/blog/pages \
             -H 'content-type: application/json' -d '{"url": "https://evil.test/"}')
           test "$status" = 422
+
+      - name: Smoke test a scan against the fixture site
+        env:
+          SENTINEL_DATABASE_URL: ${{ env.SENTINEL_TEST_DATABASE_URL }}
+        run: |
+          python -m http.server 8000 --bind 127.0.0.1 --directory examples/fixture-site &
+          site=$!
+          trap 'kill "$site"' EXIT
+          for _ in $(seq 1 30); do curl -sf localhost:8000/ >/dev/null && break; sleep 1; done
+          .venv/bin/sentinel db downgrade base
+          .venv/bin/sentinel db upgrade
+          .venv/bin/sentinel sites add demo --origin http://127.0.0.1:8000
+          .venv/bin/sentinel pages add demo http://127.0.0.1:8000/index.html
+          .venv/bin/sentinel pages add demo http://127.0.0.1:8000/checkout.html --payment
+          # robots.txt disallows /checkout: skipped, not failed.
+          .venv/bin/sentinel scan run demo --json \
+            | jq -e '.status == "completed" and .pages.skipped == 1 and .scripts.seen == 3'
+          .venv/bin/sentinel sites update demo --ignore-robots
+          .venv/bin/sentinel scan run demo --json \
+            | jq -e '.pages.ok == 2 and .scripts.seen == 7 and .scripts.new == 4'
+          .venv/bin/sentinel scripts list demo --json | jq -e 'length == 7'
+          # A page that fails makes `scan run` exit 3.
+          .venv/bin/sentinel pages add demo http://127.0.0.1:8000/missing.html
+          set +e
+          .venv/bin/sentinel scan run demo
+          test $? -eq 3

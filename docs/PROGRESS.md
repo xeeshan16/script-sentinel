@@ -50,3 +50,92 @@ One entry per day. The plan is in [PLAN.md](PLAN.md).
 **Next (day 2):** scanner v1. Fetch allowlisted pages with timeouts, size caps and
 `robots.txt` handling, parse `<script>` tags (src, inline, integrity, nonce, type) and store
 inventory snapshots, tested against a local fixture site.
+
+## Day 2 — 2026-11-22: scanner v1
+
+**Done**
+
+- `fetch.py`: the page fetcher.
+  - Redirects are followed by hand and every hop must stay on one of the site's allowed
+    origins; a redirect elsewhere is recorded as `redirect_blocked` and never followed.
+  - Connect/read timeouts plus an overall deadline per page, at most `max_redirects` hops.
+  - Bodies are streamed and abandoned past `SENTINEL_MAX_PAGE_BYTES` (a declared
+    `Content-Length` over the cap is refused before reading). An oversized page is recorded
+    as `too_large` rather than parsed up to the cut, because a truncated page would hide the
+    scripts after it.
+  - Non-HTML responses are `not_html`; a missing content type is parsed as HTML. Decoding
+    follows the browser order: BOM, then the `Content-Type` charset, then `<meta charset>`.
+- `robots.py`: RFC 9309 parsing and matching, written from the RFC because
+  `urllib.robotparser` has no `*`/`$` wildcards and applies the first matching rule instead
+  of the longest. Groups for our product token are combined, and the `*` groups are used only
+  when none match. Allow wins ties, `/robots.txt` is always allowed, and only the first
+  500 KiB are parsed. The fetcher maps HTTP status per the RFC: 2xx parsed, 4xx means no
+  rules, 5xx or unreachable means disallow everything. robots.txt is fetched once per origin
+  per scan.
+- `sites.respect_robots` (default on), with `sentinel sites add --ignore-robots`,
+  `sentinel sites update --respect-robots/--ignore-robots` and `respect_robots` in the API.
+  Checkout pages are often disallowed for crawlers, and the site owner may still want them
+  monitored. A robots refusal counts as *skipped*, not *failed*, and the CLI warns when one
+  kept a payment page out of a scan.
+- `inventory.py`: finds the scripts a browser would run, following the HTML standard where it
+  changes the answer:
+  - `type` decides whether a block is code. Missing, empty or a JavaScript MIME type is
+    classic, `module` is a module, and `importmap` is kept because it controls where modules
+    load from. Other types (`application/ld+json`, templates, `speculationrules`) are data
+    blocks, counted but not inventoried. The legacy `language` attribute applies when `type`
+    is absent.
+  - The first `<base href>` changes resolution. Scripts in `<template>` and `<noscript>` are
+    skipped. SVG scripts are read from `href`/`xlink:href`. `data:` URLs are decoded and
+    treated as inline code. An unterminated `<script>` at the end of a document is kept.
+  - Unfetchable sources (`javascript:`, `blob:`, empty `src`, invalid `data:` URLs,
+    external import maps, overlong URLs) become warnings on the snapshot instead of
+    disappearing.
+- Migration `0002`: `scans`, `page_snapshots` and `script_observations`, plus
+  `sites.respect_robots`. Snapshots keep the URL and payment flag and survive page removal
+  (`page_id` is set to NULL), because they are the evidence that a check ran. Observations
+  record the position, type, `integrity`, `crossorigin`, `referrerpolicy`, `async`/`defer`/
+  `nomodule`, and the inline body's SHA-384. Nonces are stored only as a 16-hex-character
+  SHA-256 digest: enough to notice a nonce that never changes, without keeping the value.
+  `ALTER TABLE` is used directly instead of Alembic batch mode, so SQLite never rebuilds
+  `sites` (a rebuild would cascade deletes into every table that references it).
+- `scanner.py`: fetches all pages concurrently (`SENTINEL_SCAN_CONCURRENCY`) with no
+  transaction open, then writes the scan, snapshots and observations and upserts the
+  inventory by locator in one go. New scripts start as `pending`. The scan status is
+  `completed`, `partial` or `failed` depending on how many pages failed.
+- API: `POST`/`GET /v1/sites/{name}/scans`, `GET /v1/scans/{id}`,
+  `GET /v1/sites/{name}/scripts`. CLI: `sentinel scan run|list|show`, `sentinel scripts
+  list`. `scan run` exits 3 when any page could not be inventoried.
+- `examples/fixture-site`: a synthetic shop for the quick start and the CI smoke test. Its
+  robots.txt disallows `/checkout`, which exercises the opt-out path.
+- CI: a new step serves the fixture site and checks a full scan, the robots skip, the opt-out
+  and the exit code for a failing page, against PostgreSQL.
+
+**Tests**
+
+- 235 tests locally on Python 3.13 against SQLite and PostgreSQL 16 (106 new), 100% line and
+  branch coverage. Ruff and mypy (strict) are clean.
+- The scanner and CLI tests run against a real HTTP server on `127.0.0.1` whose routes the
+  tests change mid-run (a page's inline config changes, a vendor script disappears, a page
+  starts returning 500). `httpx.MockTransport` covers timeouts, the overall deadline,
+  oversized streamed bodies, redirect loops and robots.txt status handling.
+- `test_examples.py` runs the README quick start against `examples/fixture-site`.
+- The README output comes from a real run against PostgreSQL 16, and the new CI smoke step
+  was run locally before pushing.
+
+**Known limitations (deliberate for now)**
+
+- Inline scripts are identified by their position among a page's inline blocks. Inserting a
+  block in front of others shifts the ones after it, so they will look changed. Day 5's diff
+  should match inline blocks by content similarity before falling back to position.
+- An external script with a cache-busting query (`app.js?v=123`) gets a new locator whenever
+  the query changes. Day 4's policies (pinned vs. "expected to change") are the place to
+  normalize this per vendor.
+- Only scripts present in the HTML are seen. Scripts injected at runtime are day 11.
+- `<script src="..." />` outside SVG is treated as a complete element. Browsers ignore the
+  slash and keep the element open, so the following markup becomes script text.
+- A scan through the API runs inside the request. Background scans come with the worker on
+  day 10.
+
+**Next (day 3):** hashing and versions. Fetch each external script (same limits, never as a
+page), hash it with SHA-384 raw and normalized, keep a version history per script, generate
+SRI values, and snapshot the security headers (CSP, HSTS and others) for 11.6.1.
