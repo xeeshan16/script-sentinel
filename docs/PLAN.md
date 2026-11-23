@@ -6,7 +6,7 @@ One milestone per day, starting 2026-11-21. Progress is logged in [PROGRESS.md](
 | --- | --- | --- |
 | 1 | **Scaffold:** FastAPI app, settings, SQLAlchemy + Alembic (Postgres and SQLite), a domain model (sites, pages, scripts, versions, findings), README, MIT license, CI (ruff, mypy, pytest, build), PLAN and PROGRESS. | done |
 | 2 | **Scanner v1:** fetches allowlisted pages (with timeouts, size caps and robots handling) and parses `<script>` tags (src, inline, integrity, nonce, type). Stores inventory snapshots. Tested against a local fixture site. | done |
-| 3 | **Hashing and versions:** fetches each script, hashes it with SHA-384 (raw and normalized), keeps a version history and generates SRI hashes. Captures the security headers (CSP, HSTS and others) as a snapshot for 11.6.1. | |
+| 3 | **Hashing and versions:** fetches each script, hashes it with SHA-384 (raw and normalized), keeps a version history and generates SRI hashes. Captures the security headers (CSP, HSTS and others) as a snapshot for 11.6.1. | done |
 | 4 | **Authorization workflow (6.4.3):** approve or justify each script, with policies: allowlisted origins, pinned hashes, and "expected to change" vendors. REST API and audit trail. | |
 | 5 | **Change detection and diff:** a JS-aware tokenized diff, size and entropy deltas, and new domains or URLs referenced. Findings get a severity. | |
 | 6 | **Skimmer heuristics:** new exfiltration sinks (fetch, XHR, sendBeacon, image or WebSocket to a new host), listeners on card or form fields, wallet-address regexes and swaps, eval/atob/obfuscation, and scripts that inject other scripts. Uses a corpus of synthetic malicious fixtures. | |

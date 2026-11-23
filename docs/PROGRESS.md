@@ -139,3 +139,96 @@ inventory snapshots, tested against a local fixture site.
 **Next (day 3):** hashing and versions. Fetch each external script (same limits, never as a
 page), hash it with SHA-384 raw and normalized, keep a version history per script, generate
 SRI values, and snapshot the security headers (CSP, HSTS and others) for 11.6.1.
+
+## Day 3 — 2026-11-23: hashing and versions
+
+**Done**
+
+- `fetch.py`: `PageFetcher.fetch_script`. Every external script the scanned pages reference
+  is downloaded once per scan, concurrently. Redirects are followed to any http(s) URL (a
+  browser would), a redirect to another scheme is `bad_redirect`, robots.txt is not consulted
+  (loading a subresource isn't crawling), and bodies over `SENTINEL_MAX_SCRIPT_BYTES`
+  (default 5 MiB, measured after content decoding) are `too_large` instead of hashed.
+- Fixed a crash found while testing redirects: httpx parses a redirect's `Location` eagerly
+  and raises `InvalidURL` (not an `HTTPError`) for some values, which escaped the page and
+  robots.txt fetchers too. It is now a failed fetch.
+- `jstokens.py`: a forgiving JavaScript tokenizer (strings, template literals with nested
+  `${}`, regex-versus-division from the previous token, numeric separators and BigInt,
+  private names, hashbang, Unicode line terminators). It never raises; unterminated input
+  marks the result incomplete. `normalize` drops comments and collapses whitespace but keeps
+  line breaks, because automatic semicolon insertion makes them meaningful.
+- `versions.py`: each body gets `sha384` over the exact bytes and `normalized_sha384` over
+  the normalized tokens, so a rebuild that only changed a banner comment is visibly not a
+  code change. Bodies are decoded like browsers do (BOM, then the header charset, then
+  UTF-8); NUL characters become U+FFFD in the stored text only (PostgreSQL text can't hold
+  them; the hashes use the raw bytes). Hashing runs in a worker thread so a large script
+  doesn't stall the API's event loop. `VersionRecorder` upserts versions per
+  `(script, sha384)` for a scan: a body seen again moves `last_seen_at`, a new body is a new
+  version, and a new body for a script that already had one counts as a change.
+- `sri.py`: integrity values, and checks that follow the SRI spec: unknown algorithms and
+  malformed tokens are ignored, only the strongest algorithm present counts, nothing usable
+  means the browser runs the script unchecked (`no_supported_hash`), and digests are compared
+  exactly. Each observation of an external script with `integrity` gets `match`, `mismatch`,
+  `no_supported_hash` or `unverified` (body not fetched); the same script can match on one
+  page and not on another. Integrity on inline scripts is ignored, as browsers do.
+- `inventory.py`: records `<meta http-equiv="Content-Security-Policy">` policies, and warns
+  about `integrity` on a cross-origin script without `crossorigin` (the request is no-cors,
+  the response opaque, and browsers refuse to run it).
+- `headers.py`: each page snapshot keeps the security headers as served (every value, since
+  CSP can be sent more than once): CSP and CSP-Report-Only, Integrity-Policy (and
+  report-only), HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`,
+  `Permissions-Policy`, COOP/COEP/CORP, `Reporting-Endpoints` and `Report-To`, capped in
+  count and length.
+- Migration `0003`: `script_fetches` (one row per external script per scan: outcome,
+  status, final URL, content type, size, error, version, whether the body was new), plus
+  `script_observations.version_id`/`sri_status`, `page_snapshots.security_headers`/
+  `meta_csp` and four scan counters (`scripts_fetched`, `scripts_fetch_failed`,
+  `versions_new`, `scripts_changed`). Only `script_observations` is rebuilt on SQLite (nothing
+  references it); `page_snapshots` gets plain `ADD COLUMN`s so no cascade fires.
+- API: scan responses carry the new counters, each page's headers, each script's version,
+  SRI value and status, and the script fetches. New: `GET /v1/sites/{name}/scripts/{id}`
+  (version history) and `.../versions/{version_id}/content`, served as `text/plain` with
+  `nosniff`, a sandboxing CSP and `no-store`, so stored third-party code never runs on the
+  sentinel's origin. The inventory listing includes the version count and current SRI.
+- CLI: `scan run` shows each page's security headers and each script's SRI value and
+  integrity status, marks changed scripts with `~` and unfetchable ones with `!`, and warns
+  about integrity mismatches and failed fetches. New `sentinel scripts show SITE LOCATOR`
+  prints the version history and a ready-to-paste `<script integrity=…>` tag (or the CSP hash
+  source for inline code). `scripts list` shows version counts and the current SRI.
+- Examples: `examples/serve.py` serves the fixture shop and a "third-party" CDN on two local
+  origins (`examples/fixture-cdn`), adds security headers to the shop's pages, and the
+  checkout page pins the payments library with its real SRI hash. The `.test` vendor URLs
+  are gone from the quick start, so every script in it is really fetched.
+- CI: the fixture smoke test now also checks fetch counts, the SRI match on the checkout
+  page and the captured CSP-Report-Only header, then appends a line to the fixture vendor
+  script and checks that the next scan records one new version of the same script.
+
+**Tests**
+
+- 304 tests locally on Python 3.13 against SQLite and PostgreSQL 16 (69 new), 100% line
+  and branch coverage; the suite also passes on Python 3.12 (SQLite). Ruff and mypy (strict)
+  are clean, and `examples/` is now type-checked too.
+- Scanner tests use a second local server as the vendor CDN (a different origin), change
+  its script mid-test, and check versions, changes, comment-only rebuilds (same normalized
+  hash), reverting to an earlier body (its version is reused), per-page integrity status
+  and cascade deletes.
+- Both CI smoke scripts were run locally against PostgreSQL 16 before pushing, and the
+  README output comes from a real run.
+
+**Known limitations (deliberate for now)**
+
+- "Changed" means a body this script has never served before. Going back to an earlier body
+  reuses that version and isn't counted; day 5 compares each scan with the previous one.
+- The regex-or-division guess treats `/` after `)` as division, so `if (x) /re/.test(y)`
+  tokenizes the regex as operators. It still hashes deterministically; it only matters for
+  the token diff, where the effect is a coarser diff.
+- External scripts are fetched without cookies or a page referrer, so a CDN that serves
+  different bodies per user or per referring page is only seen from one point of view.
+  The dynamic renderer (day 11) will see what a browser sees.
+- A page's `<script>` may point anywhere, including private addresses, and the scanner
+  fetches it. Pages are the operator's own, so this is an accepted risk for now; it goes in
+  the threat model on day 14 with an option to refuse private ranges.
+
+**Next (day 4):** the authorization workflow for 6.4.3. Approve, reject or justify each
+script with an audit trail, and policies: allowlisted origins, pinned hashes, and vendors
+that are expected to change (with cache-busting query normalization).

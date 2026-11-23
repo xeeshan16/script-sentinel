@@ -98,10 +98,11 @@ jobs:
         env:
           SENTINEL_DATABASE_URL: ${{ env.SENTINEL_TEST_DATABASE_URL }}
         run: |
-          python -m http.server 8000 --bind 127.0.0.1 --directory examples/fixture-site &
-          site=$!
-          trap 'kill "$site"' EXIT
-          for _ in $(seq 1 30); do curl -sf localhost:8000/ >/dev/null && break; sleep 1; done
+          # The shop on :8000 and its "third-party" CDN on :8001.
+          python examples/serve.py --port 8000 --cdn-port 8001 &
+          servers=$!
+          trap 'kill "$servers"' EXIT
+          for _ in $(seq 1 30); do curl -sf localhost:8001/analytics/v2/tag.js >/dev/null && break; sleep 1; done
           .venv/bin/sentinel db downgrade base
           .venv/bin/sentinel db upgrade
           .venv/bin/sentinel sites add demo --origin http://127.0.0.1:8000
@@ -109,11 +110,25 @@ jobs:
           .venv/bin/sentinel pages add demo http://127.0.0.1:8000/checkout.html --payment
           # robots.txt disallows /checkout: skipped, not failed.
           .venv/bin/sentinel scan run demo --json \
-            | jq -e '.status == "completed" and .pages.skipped == 1 and .scripts.seen == 3'
+            | jq -e '.status == "completed" and .pages.skipped == 1 and .scripts.seen == 3
+                     and .scripts.fetched == 2 and .scripts.versions_new == 3'
           .venv/bin/sentinel sites update demo --ignore-robots
+          scan=$(mktemp)
+          .venv/bin/sentinel scan run demo --json > "$scan"
+          jq -e '.pages.ok == 2 and .scripts.seen == 7 and .scripts.new == 4
+                 and .scripts.fetched == 4 and .scripts.fetch_failed == 0' "$scan"
+          # The payments library is pinned with SRI on the checkout page, and it matches.
+          jq -e '[.snapshots[].scripts[] | select(.locator | endswith("/payments/v3/elements.js"))]
+                 | .[0].sri_status == "match"' "$scan"
+          jq -e '.snapshots[0].security_headers["content-security-policy-report-only"] | length == 1' "$scan"
+          .venv/bin/sentinel scripts list demo --json | jq -e 'length == 7 and all(.version_count == 1)'
+          # The vendor ships a new analytics tag: a new version of the same script.
+          echo 'queue.push(["ping"]);' >> examples/fixture-cdn/analytics/v2/tag.js
           .venv/bin/sentinel scan run demo --json \
-            | jq -e '.pages.ok == 2 and .scripts.seen == 7 and .scripts.new == 4'
-          .venv/bin/sentinel scripts list demo --json | jq -e 'length == 7'
+            | jq -e '.scripts.new == 0 and .scripts.versions_new == 1 and .scripts.changed == 1'
+          .venv/bin/sentinel scripts show demo http://127.0.0.1:8001/analytics/v2/tag.js --json \
+            | jq -e '.version_count == 2'
+          git checkout -- examples/fixture-cdn
           # A page that fails makes `scan run` exit 3.
           .venv/bin/sentinel pages add demo http://127.0.0.1:8000/missing.html
           set +e

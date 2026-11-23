@@ -12,9 +12,10 @@ code runs on your checkout page with your users' trust. script-sentinel keeps an
 every script your pages load, pins what each one should look like, and tells you when one
 changes and whether the change looks like a skimmer.
 
-> **Status: in active development (day 2 of 14).** The site and page registry, scan
-> allowlist and scanner v1 work: scans fetch your pages, inventory every script they load and
-> keep a snapshot of each scan. Hashing and versioning of script bodies land on day 3. See
+> **Status: in active development (day 3 of 14).** Scans fetch your pages, inventory every
+> script they load, download and hash every script body, keep a version history per script,
+> check `integrity` attributes the way a browser does, and snapshot each page's security
+> headers. The approve-and-justify workflow (PCI DSS 6.4.3) lands on day 4. See
 > [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for
 > the daily log.
 
@@ -38,7 +39,9 @@ changes and whether the change looks like a skimmer.
 | Allowlist | Browser-style origin normalization (case, IDNA, default ports, IPv6), exact matching, credentials in URLs refused | ✅ day 1 |
 | Scanner | Fetches registered pages with timeouts, size caps, allowlist-checked redirects and RFC 9309 `robots.txt` handling; keeps a snapshot of every scan | ✅ day 2 |
 | Inventory | Every script a browser would run, per page and in order: inline, external, module, import map, SVG and `data:` scripts, with `integrity`, `nonce`, `crossorigin` and `type` | ✅ day 2 |
-| Pinning | SHA-384 version history per script, SRI hash generation, security-header snapshots | day 3 |
+| Versions | Every body (inline or external) hashed with SHA-384 over the exact bytes and over a comment- and whitespace-insensitive JS token stream; a version history per script, so a vendor change is a new version of the same script | ✅ day 3 |
+| Integrity | `integrity` attributes checked the way browsers do (strongest algorithm wins); SRI values to pin each body; CSP hash sources for inline code; a warning for SRI on a cross-origin script without `crossorigin` | ✅ day 3 |
+| Headers (11.6.1) | CSP, CSP-Report-Only, Integrity-Policy, HSTS, `X-Content-Type-Options` and other security headers, plus `<meta>` CSPs, snapshotted per page per scan | ✅ day 3 |
 | Authorization (6.4.3) | Approve or justify each script; pinned hashes, allowlisted origins, "expected to change" vendors; audit trail | day 4 |
 | Change review | JS-aware tokenized diff, size and entropy deltas, newly referenced domains | day 5 |
 | Skimmer heuristics | New exfiltration sinks, card-field listeners, wallet-address swaps, obfuscation, script injection | day 6 |
@@ -80,6 +83,10 @@ erDiagram
     PAGE |o--o{ PAGE_SNAPSHOT : "snapshots of"
     PAGE_SNAPSHOT ||--o{ SCRIPT_OBSERVATION : saw
     SCRIPT ||--o{ SCRIPT_OBSERVATION : "observed as"
+    SCRIPT_VERSION |o--o{ SCRIPT_OBSERVATION : "body seen"
+    SCAN ||--o{ SCRIPT_FETCH : downloads
+    SCRIPT ||--o{ SCRIPT_FETCH : "fetched as"
+    SCRIPT_VERSION |o--o{ SCRIPT_FETCH : got
     SITE {
         uuid id
         string name
@@ -94,12 +101,15 @@ erDiagram
         int pages_skipped
         int pages_failed
         int scripts_new
+        int scripts_changed
     }
     PAGE_SNAPSHOT {
         enum outcome "ok | robots_disallowed | http_error | ..."
         string final_url
         string body_sha384
         json warnings
+        json security_headers
+        json meta_csp
     }
     SCRIPT_OBSERVATION {
         int position
@@ -107,6 +117,13 @@ erDiagram
         string integrity
         string nonce_digest "never the nonce itself"
         string inline_sha384
+        enum sri_status "match | mismatch | no_supported_hash | unverified"
+    }
+    SCRIPT_FETCH {
+        enum outcome "ok | http_error | too_large | ..."
+        int http_status
+        string final_url
+        bool new_version
     }
     PAGE {
         string url "on an allowed origin"
@@ -122,6 +139,7 @@ erDiagram
         string sha384 "unique per script"
         string normalized_sha384
         int size_bytes
+        text content
     }
     FINDING {
         string kind
@@ -139,7 +157,7 @@ Design notes:
   within their site, so history and approvals follow the script across body changes.
 - **The scanner stays on the allowlist.** Redirects are followed by hand and every hop must
   be on an allowed origin; a page that redirects elsewhere is reported as `redirect_blocked`.
-  Third-party script URLs are recorded but never fetched as pages.
+  Third-party script URLs are fetched only as scripts, never as pages.
 - **No half-parsed pages.** A page over `SENTINEL_MAX_PAGE_BYTES` is reported as `too_large`
   instead of being parsed up to the cut, which would silently hide the scripts after it.
 - **robots.txt per RFC 9309,** including wildcards and longest-match precedence (which
@@ -155,6 +173,24 @@ Design notes:
   the snapshot instead of disappearing.
 - **No database transaction is held across the network.** A scan fetches first, then writes
   the scan, its snapshots and the inventory in one go.
+- **Two hashes per body.** `sha384` covers the exact bytes (what Subresource Integrity
+  checks). `normalized_sha384` covers the body's JavaScript tokens with comments dropped and
+  whitespace collapsed (line breaks kept, because automatic semicolon insertion makes them
+  meaningful), so a rebuild that only changed a banner comment or `sourceMappingURL` can be
+  told apart from a change in the code. The tokenizer handles strings, template literals
+  with nested substitutions, regex-versus-division and unterminated input, and is the base
+  for day 5's token diff.
+- **Integrity checked like a browser.** Only the strongest algorithm in an `integrity`
+  attribute counts (`sha256-<good> sha384-<bad>` fails), unusable values mean the script
+  runs unchecked (reported as `no_supported_hash`), and digests are compared exactly. SRI
+  on a cross-origin script without `crossorigin` is flagged, because browsers refuse to run
+  it.
+- **Script bodies are fetched once per scan, off the event loop.** Every external script
+  the pages reference is downloaded once (redirects to any http(s) URL are followed, as a
+  browser would; robots.txt doesn't apply to subresources), capped at
+  `SENTINEL_MAX_SCRIPT_BYTES`, and hashed in a worker thread.
+- **Stored third-party code never runs on the sentinel's origin.** Version bodies are served
+  as `text/plain` with `nosniff` and a sandboxing CSP.
 - **Findings outlive the scripts they're about.** Deleting a script sets the reference on its
   findings to `NULL` instead of deleting them; they are audit evidence.
 - **Portable schema.** Enums are `VARCHAR` + `CHECK`, JSON is `JSONB` on PostgreSQL, and
@@ -191,11 +227,12 @@ shop                 pages=1    payment=1    every 168h  http://localhost:8000, 
 
 ### Scan a site
 
-[`examples/fixture-site`](examples/fixture-site) is a small synthetic shop whose
-`robots.txt` disallows `/checkout`, as many real shops do. Serve it and scan it:
+[`examples/`](examples) holds a small synthetic shop and the "third-party" CDN it loads
+scripts from, on two local origins. The shop's `robots.txt` disallows `/checkout`, as many
+real shops do. Serve both and register the shop:
 
 ```bash
-python -m http.server 8000 --bind 127.0.0.1 --directory examples/fixture-site &
+python examples/serve.py &    # shop on 127.0.0.1:8000, CDN on 127.0.0.1:8001
 uv run sentinel sites add demo --origin http://127.0.0.1:8000
 uv run sentinel pages add demo http://127.0.0.1:8000/index.html --label home
 uv run sentinel pages add demo http://127.0.0.1:8000/checkout.html --payment --label checkout
@@ -203,48 +240,91 @@ uv run sentinel pages add demo http://127.0.0.1:8000/checkout.html --payment --l
 
 ```console
 $ uv run sentinel scan run demo
-scan 68355b96-2413-48a2-8191-7623f7432761 of demo: completed in 0.03s (2 pages: 1 ok, 1 skipped)
+scan 8d81462d-7f10-4b4e-bd33-9a1654a374bf of demo: completed in 0.04s (2 pages: 1 ok, 1 skipped)
   robots   http://127.0.0.1:8000/checkout.html [payment]  disallowed by robots.txt (parsed)
   ok       http://127.0.0.1:8000/index.html  200  3 scripts (3 new)
-      + http://127.0.0.1:8000/js/app.js  (classic)
-      + https://cdn.vendor.test/analytics/v2/tag.js  (classic)
-      + http://127.0.0.1:8000/index.html#inline-1  (classic)
+      headers: nosniff, Referrer-Policy
+      + http://127.0.0.1:8000/js/app.js  (classic)  sha384-oaeGFW/oKjuWczG…
+      + http://127.0.0.1:8001/analytics/v2/tag.js  (classic)  sha384-raygKpbLnYdKgM3…
+      + http://127.0.0.1:8000/index.html#inline-1  (classic)  sha384-uSDeh2gpqss7OOr…
 inventory: 3 scripts seen, 3 new (pending approval)
+bodies: 2 external fetched, 0 failed; 3 new versions, 0 scripts changed
 warning: robots.txt kept payment pages out of this scan; if they are your own pages, run: sentinel sites update demo --ignore-robots
 $ uv run sentinel sites update demo --ignore-robots
 updated site demo: scan every 168h, robots.txt ignored
 $ uv run sentinel scan run demo
-scan 442f6005-f665-4bdb-8068-70fd74d2a969 of demo: completed in 0.03s (2 pages: 2 ok)
+scan 2167fba1-1378-4aa3-aa2c-0cd23cdf758a of demo: completed in 0.04s (2 pages: 2 ok)
   ok       http://127.0.0.1:8000/checkout.html [payment]  200  6 scripts (4 new)
-      + http://127.0.0.1:8000/checkout.html#inline-1  (classic, nonce)
-      + http://127.0.0.1:8000/checkout.html#inline-2  (importmap)
-        http://127.0.0.1:8000/js/app.js  (classic)
-        https://cdn.vendor.test/analytics/v2/tag.js  (classic)
-      + https://js.payments.test/v3/elements.js  (classic, integrity)
-      + http://127.0.0.1:8000/js/checkout.mjs  (module)
+      headers: CSP report-only, nosniff, Referrer-Policy
+      + http://127.0.0.1:8000/checkout.html#inline-1  (classic, nonce)  sha384-lXDOInm1aF5PqqU…
+      + http://127.0.0.1:8000/checkout.html#inline-2  (importmap)  sha384-RK3hVJoVsFjKTgJ…
+        http://127.0.0.1:8000/js/app.js  (classic)  sha384-oaeGFW/oKjuWczG…
+        http://127.0.0.1:8001/analytics/v2/tag.js  (classic)  sha384-raygKpbLnYdKgM3…
+      + http://127.0.0.1:8001/payments/v3/elements.js  (classic, integrity ok)  sha384-i+C8D+bUmsEtpaC…
+      + http://127.0.0.1:8000/js/checkout.mjs  (module)  sha384-V9XBxb1rMJcHI5I…
   ok       http://127.0.0.1:8000/index.html  200  3 scripts
-        http://127.0.0.1:8000/js/app.js  (classic)
-        https://cdn.vendor.test/analytics/v2/tag.js  (classic)
-        http://127.0.0.1:8000/index.html#inline-1  (classic)
+      headers: nosniff, Referrer-Policy
+        http://127.0.0.1:8000/js/app.js  (classic)  sha384-oaeGFW/oKjuWczG…
+        http://127.0.0.1:8001/analytics/v2/tag.js  (classic)  sha384-raygKpbLnYdKgM3…
+        http://127.0.0.1:8000/index.html#inline-1  (classic)  sha384-uSDeh2gpqss7OOr…
 inventory: 7 scripts seen, 4 new (pending approval)
+bodies: 4 external fetched, 0 failed; 4 new versions, 0 scripts changed
 $ uv run sentinel scripts list demo
-pending   external  http://127.0.0.1:8000/js/app.js
-pending   external  http://127.0.0.1:8000/js/checkout.mjs
-pending   external  https://cdn.vendor.test/analytics/v2/tag.js
-pending   external  https://js.payments.test/v3/elements.js
-pending   inline    http://127.0.0.1:8000/checkout.html#inline-1
-pending   inline    http://127.0.0.1:8000/checkout.html#inline-2
-pending   inline    http://127.0.0.1:8000/index.html#inline-1
-$ uv run sentinel scan list demo
-2026-11-22 10:08:30Z  442f6005-f665-4bdb-8068-70fd74d2a969  completed cli      pages ok=2 skipped=0 failed=0  scripts=7 new=4
-2026-11-22 10:08:29Z  68355b96-2413-48a2-8191-7623f7432761  completed cli      pages ok=1 skipped=1 failed=0  scripts=3 new=3
+pending   external  v1   sha384-oaeGFW/oKjuWczG…   http://127.0.0.1:8000/js/app.js
+pending   external  v1   sha384-V9XBxb1rMJcHI5I…   http://127.0.0.1:8000/js/checkout.mjs
+pending   external  v1   sha384-raygKpbLnYdKgM3…   http://127.0.0.1:8001/analytics/v2/tag.js
+pending   external  v1   sha384-i+C8D+bUmsEtpaC…   http://127.0.0.1:8001/payments/v3/elements.js
+pending   inline    v1   sha384-lXDOInm1aF5PqqU…   http://127.0.0.1:8000/checkout.html#inline-1
+pending   inline    v1   sha384-RK3hVJoVsFjKTgJ…   http://127.0.0.1:8000/checkout.html#inline-2
+pending   inline    v1   sha384-uSDeh2gpqss7OOr…   http://127.0.0.1:8000/index.html#inline-1
 ```
 
 `+` marks a script seen for the first time. Every new script starts as `pending`: under PCI
-DSS 6.4.3 it needs an authorization and a written justification (day 4). The JSON
-`application/ld+json` block on the checkout page is counted but not inventoried, because it
-never runs. `sentinel scan run` exits 3 when any page could not be inventoried, so it can
-gate a cron job or a pipeline; `--json` prints the whole scan.
+DSS 6.4.3 it needs an authorization and a written justification (day 4). The checkout page
+pins the payments library with SRI, and the scan confirms a browser would accept the body
+it got (`integrity ok`). The JSON `application/ld+json` block on the checkout page is
+counted but not inventoried, because it never runs.
+
+Now play the vendor: the analytics tag on the CDN changes, with no deploy on the shop's side.
+
+```console
+$ echo 'queue.push(["ping"]);' >> examples/fixture-cdn/analytics/v2/tag.js
+$ uv run sentinel scan run demo
+scan 869bc596-a6ee-421e-9c18-7d7978d7c132 of demo: completed in 0.04s (2 pages: 2 ok)
+  ok       http://127.0.0.1:8000/checkout.html [payment]  200  6 scripts
+      headers: CSP report-only, nosniff, Referrer-Policy
+        http://127.0.0.1:8000/checkout.html#inline-1  (classic, nonce)  sha384-lXDOInm1aF5PqqU…
+        http://127.0.0.1:8000/checkout.html#inline-2  (importmap)  sha384-RK3hVJoVsFjKTgJ…
+        http://127.0.0.1:8000/js/app.js  (classic)  sha384-oaeGFW/oKjuWczG…
+      ~ http://127.0.0.1:8001/analytics/v2/tag.js  (classic)  sha384-5R5tM2xxeboPVK+…
+        http://127.0.0.1:8001/payments/v3/elements.js  (classic, integrity ok)  sha384-i+C8D+bUmsEtpaC…
+        http://127.0.0.1:8000/js/checkout.mjs  (module)  sha384-V9XBxb1rMJcHI5I…
+  ok       http://127.0.0.1:8000/index.html  200  3 scripts
+      headers: nosniff, Referrer-Policy
+        http://127.0.0.1:8000/js/app.js  (classic)  sha384-oaeGFW/oKjuWczG…
+      ~ http://127.0.0.1:8001/analytics/v2/tag.js  (classic)  sha384-5R5tM2xxeboPVK+…
+        http://127.0.0.1:8000/index.html#inline-1  (classic)  sha384-uSDeh2gpqss7OOr…
+inventory: 7 scripts seen, 0 new (pending approval)
+bodies: 4 external fetched, 0 failed; 1 new versions, 1 scripts changed
+$ uv run sentinel scripts show demo http://127.0.0.1:8001/analytics/v2/tag.js
+http://127.0.0.1:8001/analytics/v2/tag.js
+  kind: external   status: pending
+  seen: 2026-11-23 10:11:18Z .. 2026-11-23 10:11:21Z
+  versions (2, most recently seen first):
+    2026-11-23 10:11:21Z       231 bytes  sha384-5R5tM2xxeboPVK+WaFsUzTA2YwHEgRK/wn7ptQQByydFrdEChhOQ1FYewCG6Zj52
+    2026-11-23 10:11:19Z       209 bytes  sha384-raygKpbLnYdKgM3/yZTB+rNJEmEUx75tgDCpLy3OMpv6OlnikQK3g4yXoPd2vFCD
+  pin the current body with:
+    <script src="http://127.0.0.1:8001/analytics/v2/tag.js" integrity="sha384-5R5tM2xxeboPVK+WaFsUzTA2YwHEgRK/wn7ptQQByydFrdEChhOQ1FYewCG6Zj52" crossorigin="anonymous"></script>
+$ uv run sentinel scripts show demo 'http://127.0.0.1:8000/checkout.html#inline-1' | tail -1
+  CSP hash source for the current body: 'sha384-lXDOInm1aF5PqqUrDg5CaId7/zhFcRp49CafOH2uDqHBYq9Cjkh80E/lvWCymFNd'
+$ git checkout -- examples/fixture-cdn    # put the fixture back
+```
+
+`~` marks a script whose body changed: same script, new version. Judging whether that
+change is acceptable is the job of the authorization policies (day 4) and the diff and
+skimmer heuristics (days 5 and 6). `sentinel scan run` exits 3 when any page could not be
+inventoried, so it can gate a cron job or a pipeline; `--json` prints the whole scan,
+including each page's security headers and every script fetch.
 
 (Output from a real run against PostgreSQL 16.)
 
@@ -292,7 +372,9 @@ $ curl -s -X POST localhost:8080/v1/sites/blog/pages -H 'content-type: applicati
 | `POST` | `/v1/sites/{name}/scans` | Scan every page now; returns the scan with each page's snapshot and scripts (`422` if the site has no pages) |
 | `GET` | `/v1/sites/{name}/scans?limit=20` | Recent scans, newest first |
 | `GET` | `/v1/scans/{id}` | One scan with its snapshots and script observations |
-| `GET` | `/v1/sites/{name}/scripts` | The site's script inventory with authorization status |
+| `GET` | `/v1/sites/{name}/scripts` | The site's script inventory with authorization status, version count and current SRI value |
+| `GET` | `/v1/sites/{name}/scripts/{id}` | One script with its version history (hashes, SRI, size, first and last seen) |
+| `GET` | `/v1/sites/{name}/scripts/{id}/versions/{version_id}/content` | One version's body, as `text/plain` with `nosniff` and a sandboxing CSP |
 
 `PATCH /v1/sites/{name}` also accepts `respect_robots`. A scan through the API runs inside
 the request for now; scheduled background scans arrive with the worker on day 10.
@@ -307,7 +389,8 @@ the request for now; scheduled background scans arrive with the worker on day 10
 | `SENTINEL_USER_AGENT` | `script-sentinel/<version> (+https://github.com/xeeshan16/script-sentinel)` | User-Agent for fetches; the part before the first `/` is the robots.txt product token |
 | `SENTINEL_FETCH_TIMEOUT_SECONDS` | `10` | Deadline for one page, including redirects and robots.txt |
 | `SENTINEL_MAX_PAGE_BYTES` | `2097152` | Larger pages are reported as `too_large` instead of parsed |
-| `SENTINEL_MAX_REDIRECTS` | `5` | Redirect hops per page |
+| `SENTINEL_MAX_SCRIPT_BYTES` | `5242880` | Larger external scripts are reported as `too_large` instead of hashed |
+| `SENTINEL_MAX_REDIRECTS` | `5` | Redirect hops per page or script |
 | `SENTINEL_SCAN_CONCURRENCY` | `4` | Pages fetched at once during a scan |
 
 The default URL's credentials are local-development placeholders; set your own in production.
@@ -328,9 +411,11 @@ uv run pytest
 CI runs the same checks on Python 3.12 and 3.13 against SQLite and PostgreSQL 16, builds the
 package, smoke-tests the CLI and API against PostgreSQL, and scans the fixture site.
 
-Scanner tests run against a real HTTP server on `127.0.0.1` whose pages the tests change
-mid-run, plus `httpx.MockTransport` for timeouts, oversized bodies and broken servers. No test
-touches the internet.
+Scanner tests run against two real HTTP servers on `127.0.0.1` (the shop and a vendor CDN on
+another origin) whose pages and scripts the tests change mid-run, plus `httpx.MockTransport`
+for timeouts, oversized bodies, odd redirects and broken servers. No test touches the
+internet. CI also changes a vendor script in the fixture CDN between two scans and checks
+that it is recorded as a new version of the same script.
 
 ## Project layout
 
@@ -347,9 +432,15 @@ src/script_sentinel/
   fetch.py          page fetcher: timeouts, size caps, redirects, robots.txt
   robots.py         RFC 9309 robots.txt parsing and matching
   inventory.py      finds the scripts a browser would run on a page
-  scanner.py        runs a scan and records snapshots and the inventory
+  headers.py        captures a page's security-relevant response headers
+  jstokens.py       JavaScript tokenizer and the normalized form used for hashing
+  sri.py            Subresource Integrity values and browser-style checks
+  versions.py       body hashing and per-script version history
+  scanner.py        runs a scan and records snapshots, fetches, versions and the inventory
 examples/
+  serve.py          serves the fixture shop and its CDN on two local origins
   fixture-site/     synthetic shop for the quick start and CI
+  fixture-cdn/      the "third-party" scripts it loads
 tests/              pytest suite (SQLite always, PostgreSQL when configured)
 docs/               PLAN.md and PROGRESS.md
 ```
