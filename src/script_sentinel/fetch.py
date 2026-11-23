@@ -11,6 +11,13 @@ Rules the fetcher enforces:
   because a truncated page would hide the scripts after the cut.
 * **robots.txt per RFC 9309.** Fetched once per origin per scan. 2xx is parsed, 4xx means
   there are no rules, and 5xx or an unreachable server means everything is disallowed.
+
+External scripts are fetched with :meth:`PageFetcher.fetch_script`, only because an
+allowlisted page references them. A browser follows a script's redirects to any http(s)
+URL, so the fetcher does too (up to ``max_redirects``), but it never treats the body as a
+page. robots.txt doesn't apply: loading a subresource a page asks for isn't crawling. Bodies
+are capped at ``max_script_bytes``, measured after content decoding, which is also what
+Subresource Integrity hashes.
 """
 
 from __future__ import annotations
@@ -22,11 +29,13 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from script_sentinel.db.models import ScriptFetchOutcome
 from script_sentinel.db.models import SnapshotOutcome as Outcome
+from script_sentinel.headers import capture_security_headers
 from script_sentinel.origins import is_allowed, origin_of
 from script_sentinel.robots import MAX_ROBOTS_BYTES, RobotsPolicy
 
@@ -41,6 +50,7 @@ class FetchLimits:
     max_page_bytes: int = 2 * 1024 * 1024
     max_redirects: int = 5
     user_agent: str = "script-sentinel"
+    max_script_bytes: int = 5 * 1024 * 1024
 
     @property
     def product_token(self) -> str:
@@ -58,6 +68,20 @@ class FetchResult:
     text: str | None = None
     size_bytes: int | None = None
     body_sha384: str | None = None
+    elapsed_ms: int = 0
+    error: str | None = None
+    redirects: list[str] = field(default_factory=list)
+    security_headers: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ScriptFetchResult:
+    url: str
+    outcome: ScriptFetchOutcome
+    final_url: str | None = None
+    status_code: int | None = None
+    content_type: str | None = None
+    body: bytes | None = None
     elapsed_ms: int = 0
     error: str | None = None
     redirects: list[str] = field(default_factory=list)
@@ -188,7 +212,7 @@ class PageFetcher:
                             return RobotsPolicy.allow_everything(f"unavailable ({status})")
                         return RobotsPolicy.disallow_everything(f"unreachable ({status})")
                 return RobotsPolicy.allow_everything("too many redirects")
-        except (TimeoutError, httpx.HTTPError) as exc:
+        except (TimeoutError, httpx.HTTPError, httpx.InvalidURL) as exc:
             return RobotsPolicy.disallow_everything(f"unreachable ({type(exc).__name__})")
 
     # Pages
@@ -235,13 +259,15 @@ class PageFetcher:
             result.error = f"timed out after {self.limits.timeout_seconds:g}s"
         except httpx.TimeoutException as exc:
             result.error = f"timed out ({type(exc).__name__})"
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            # InvalidURL: httpx parses a redirect's Location eagerly and rejects some.
             result.error = f"{type(exc).__name__}: {exc}"[:500]
         return result
 
     async def _finish(self, result: FetchResult, response: httpx.Response) -> FetchResult:
         content_type = response.headers.get("content-type")
         result.content_type = content_type
+        result.security_headers = capture_security_headers(response.headers)
         if response.status_code >= 400 or response.status_code < 200:
             result.outcome = Outcome.HTTP_ERROR
             result.error = f"HTTP {response.status_code}"
@@ -264,6 +290,67 @@ class PageFetcher:
         result.size_bytes = len(body)
         result.body_sha384 = hashlib.sha384(body).hexdigest()
         result.text = decode_html(body, content_type)
+        return result
+
+    # Scripts
+
+    async def fetch_script(self, url: str) -> ScriptFetchResult:
+        """Download one external script. Never raises; failures are in the result."""
+        started = self._clock()
+        result = await self._fetch_script(url)
+        result.elapsed_ms = max(0, round((self._clock() - started) * 1000))
+        return result
+
+    async def _fetch_script(self, url: str) -> ScriptFetchResult:
+        result = ScriptFetchResult(url=url, outcome=ScriptFetchOutcome.FETCH_ERROR)
+        current = url
+        headers = {"accept": "*/*"}
+        try:
+            async with asyncio.timeout(self.limits.timeout_seconds):
+                for _ in range(self.limits.max_redirects + 1):
+                    if urlsplit(current).scheme not in ("http", "https"):
+                        result.outcome = ScriptFetchOutcome.BAD_REDIRECT
+                        result.error = f"redirected to a non-http(s) URL: {current[:200]}"
+                        return result
+                    async with self._client.stream("GET", current, headers=headers) as response:
+                        result.status_code = response.status_code
+                        result.final_url = current
+                        location = response.headers.get("location")
+                        if response.status_code in _REDIRECTS and location:
+                            current = urljoin(current, location)
+                            result.redirects.append(current)
+                            continue
+                        return await self._finish_script(result, response)
+                result.error = f"more than {self.limits.max_redirects} redirects"
+                return result
+        except TimeoutError:
+            result.error = f"timed out after {self.limits.timeout_seconds:g}s"
+        except httpx.TimeoutException as exc:
+            result.error = f"timed out ({type(exc).__name__})"
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            # InvalidURL: httpx parses a redirect's Location eagerly and rejects some.
+            result.error = f"{type(exc).__name__}: {exc}"[:500]
+        return result
+
+    async def _finish_script(
+        self, result: ScriptFetchResult, response: httpx.Response
+    ) -> ScriptFetchResult:
+        result.content_type = response.headers.get("content-type")
+        if not 200 <= response.status_code < 300:
+            result.outcome = ScriptFetchOutcome.HTTP_ERROR
+            result.error = f"HTTP {response.status_code}"
+            return result
+        try:
+            body = await _read_capped(response, self.limits.max_script_bytes)
+        except _TooLargeError:
+            result.outcome = ScriptFetchOutcome.TOO_LARGE
+            result.error = (
+                f"script is larger than {self.limits.max_script_bytes} bytes "
+                "(raise SENTINEL_MAX_SCRIPT_BYTES to hash it)"
+            )
+            return result
+        result.outcome = ScriptFetchOutcome.OK
+        result.body = body
         return result
 
 

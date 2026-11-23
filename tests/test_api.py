@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from script_sentinel.app import create_app
 from script_sentinel.config import Settings
+from script_sentinel.sri import integrity_value
 from tests.conftest import FixtureSite
 
 SHOP = "https://shop.example.com"
@@ -114,6 +115,8 @@ def test_openapi_lists_the_routes(client: TestClient) -> None:
         "/v1/sites/{name}/pages",
         "/v1/sites/{name}/scans",
         "/v1/sites/{name}/scripts",
+        "/v1/sites/{name}/scripts/{script_id}",
+        "/v1/sites/{name}/scripts/{script_id}/versions/{version_id}/content",
         "/v1/scans/{scan_id}",
         "/healthz",
     } <= set(paths)
@@ -121,9 +124,11 @@ def test_openapi_lists_the_routes(client: TestClient) -> None:
 
 def test_scans_and_inventory(client: TestClient, fixture_site: FixtureSite) -> None:
     fixture_site.set("/robots.txt", "User-agent: *\nDisallow: /checkout\n")
-    fixture_site.page(
+    fixture_site.set("/app.js", b"app();", content_type="text/javascript")
+    fixture_site.set(
         "/checkout",
         '<script src="/app.js" integrity="sha384-x"></script><script nonce="z">pay()</script>',
+        x_frame_options="DENY",
     )
     response = client.post(
         "/v1/sites",
@@ -163,6 +168,18 @@ def test_scans_and_inventory(client: TestClient, fixture_site: FixtureSite) -> N
         True,
         5,
     )
+    assert (external["sri_status"], external["sri"]) == ("mismatch", integrity_value(b"app();"))
+    assert (inline["sri_status"], inline["sri"]) == (None, integrity_value(b"pay()"))
+    assert snapshot["security_headers"] == {"x-frame-options": ["DENY"]}
+    assert snapshot["meta_csp"] == []
+    assert (scan["scripts_fetched"], scan["versions_new"], scan["scripts_changed"]) == (1, 2, 0)
+    (fetch,) = scan["script_fetches"]
+    assert (fetch["url"], fetch["outcome"], fetch["new_version"]) == (
+        fixture_site.url("/app.js"),
+        "ok",
+        True,
+    )
+    assert fetch["version_id"] == external["version_id"]
 
     assert client.get(f"/v1/scans/{scan['id']}").json() == scan
     listing = client.get("/v1/sites/shop/scans").json()
@@ -171,10 +188,41 @@ def test_scans_and_inventory(client: TestClient, fixture_site: FixtureSite) -> N
     assert len(client.get("/v1/sites/shop/scans", params={"limit": 1}).json()["scans"]) == 1
 
     scripts = client.get("/v1/sites/shop/scripts").json()
-    assert [(s["kind"], s["status"]) for s in scripts["scripts"]] == [
-        ("external", "pending"),
-        ("inline", "pending"),
+    assert [(s["kind"], s["status"], s["version_count"]) for s in scripts["scripts"]] == [
+        ("external", "pending", 1),
+        ("inline", "pending", 1),
     ]
+    app_js = scripts["scripts"][0]
+    assert app_js["current_version"]["sri"] == integrity_value(b"app();")
+
+    # The vendor changes app.js: a second version, now the current one.
+    fixture_site.set("/app.js", b"app(2);", content_type="text/javascript")
+    rescan = client.post("/v1/sites/shop/scans").json()
+    assert (rescan["versions_new"], rescan["scripts_changed"]) == (1, 1)
+    detail = client.get(f"/v1/sites/shop/scripts/{app_js['id']}").json()
+    assert detail["version_count"] == 2
+    assert [v["sri"] for v in detail["versions"]] == [
+        integrity_value(b"app(2);"),
+        integrity_value(b"app();"),
+    ]
+    assert detail["current_version"] == detail["versions"][0]
+    assert detail["versions"][0]["size_bytes"] == 7
+
+    old = detail["versions"][1]
+    content = client.get(f"/v1/sites/shop/scripts/{app_js['id']}/versions/{old['id']}/content")
+    assert content.status_code == 200
+    assert content.text == "app();"
+    # Never served as something a browser would run.
+    assert content.headers["content-type"] == "text/plain; charset=utf-8"
+    assert content.headers["x-content-type-options"] == "nosniff"
+    assert content.headers["content-security-policy"] == "default-src 'none'; sandbox"
+    assert content.headers["x-script-sha384"] == old["sha384"]
+
+    base = f"/v1/sites/shop/scripts/{app_js['id']}"
+    assert client.get(f"/v1/sites/shop/scripts/{uuid.uuid4()}").status_code == 404
+    assert client.get(f"/v1/sites/nope/scripts/{app_js['id']}").status_code == 404
+    assert client.get(f"{base}/versions/{uuid.uuid4()}/content").status_code == 404
+    assert client.get(f"{base}/versions/nope/content").status_code == 422
 
 
 def test_scan_errors(client: TestClient) -> None:

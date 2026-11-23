@@ -212,3 +212,32 @@ def test_decode_data_url() -> None:
 
 def test_inline_locator() -> None:
     assert inline_locator("https://shop.test/", 3) == "https://shop.test/#inline-3"
+
+
+def test_meta_csp_is_recorded() -> None:
+    html = """<head><meta http-equiv="Content-Security-Policy" content=" script-src 'self' ">
+    <meta http-equiv="refresh" content="5"><meta http-equiv="content-security-policy">
+    <noscript><meta http-equiv="Content-Security-Policy" content="ignored"></noscript></head>"""
+    assert parse_scripts(html, PAGE).meta_csp == ["script-src 'self'"]
+
+
+def test_integrity_on_a_cross_origin_script_needs_crossorigin() -> None:
+    html = """
+    <script src="https://cdn.vendor.test/a.js" integrity="sha384-x"></script>
+    <script src="https://cdn.vendor.test/b.js" integrity="sha384-x" crossorigin></script>
+    <script src="/c.js" integrity="sha384-x"></script>
+    <script src="https://cdn.vendor.test/d.js"></script>
+    """
+    inv = parse_scripts(html, PAGE)
+    assert len(inv.scripts) == 4
+    assert inv.warnings == [
+        "integrity on cross-origin script https://cdn.vendor.test/a.js without a crossorigin "
+        "attribute: browsers will refuse to run it"
+    ]
+
+
+def test_integrity_warning_tolerates_urls_without_an_origin() -> None:
+    # A src with credentials has no usable origin; it still counts as cross-origin.
+    html = '<script src="https://user:pw@cdn.test/a.js" integrity="sha384-x"></script>'
+    (warning,) = parse_scripts(html, PAGE).warnings
+    assert warning.startswith("integrity on cross-origin script")

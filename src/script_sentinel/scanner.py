@@ -4,11 +4,16 @@ A scan has two phases so that no database transaction is held open while waiting
 network:
 
 1. **Fetch** every registered page concurrently (bounded by ``concurrency``) through a
-   :class:`~script_sentinel.fetch.PageFetcher`, and parse each HTML page's scripts.
+   :class:`~script_sentinel.fetch.PageFetcher`, and parse each HTML page's scripts. Then
+   fetch every external script those pages reference, once per URL, and hash the bodies
+   in a worker thread so large scripts don't stall the event loop.
 2. **Record** the results in one transaction: a :class:`Scan`, one :class:`PageSnapshot`
-   per page, and a :class:`ScriptObservation` per script. Scripts are upserted into the
-   site's inventory by locator; a script seen for the first time starts as ``pending``
-   (it still needs a justification under PCI DSS 6.4.3).
+   per page (with its security headers), a :class:`ScriptObservation` per script, and a
+   :class:`ScriptFetch` per external script. Scripts are upserted into the site's
+   inventory by locator; a script seen for the first time starts as ``pending`` (it still
+   needs a justification under PCI DSS 6.4.3). Every body, inline or external, is
+   recorded as a :class:`ScriptVersion`, and each ``integrity`` attribute is checked
+   against the body the way a browser would.
 
 The scan itself never decides whether a script is acceptable. That is the policy engine's
 job (day 4), working from the inventory this builds.
@@ -18,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -33,15 +38,21 @@ from script_sentinel.db.models import (
     ScanStatus,
     ScanTrigger,
     Script,
+    ScriptFetch,
+    ScriptFetchOutcome,
     ScriptKind,
     ScriptObservation,
+    ScriptVersion,
     Site,
     SnapshotOutcome,
+    SriStatus,
     utcnow,
 )
-from script_sentinel.fetch import FetchResult, PageFetcher
+from script_sentinel.fetch import FetchResult, PageFetcher, ScriptFetchResult
 from script_sentinel.inventory import PageInventory, ParsedScript, inline_locator, parse_scripts
 from script_sentinel.sites import NotFoundError, ValidationError, get_site, list_pages
+from script_sentinel.sri import check_integrity_digests
+from script_sentinel.versions import BodyDigest, VersionRecorder, digest_body
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +62,13 @@ class PageResult:
     payment_page: bool
     fetch: FetchResult
     inventory: PageInventory | None
+    fetched_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class FetchedScript:
+    fetch: ScriptFetchResult
+    digest: BodyDigest | None  # set when the fetch succeeded
     fetched_at: datetime
 
 
@@ -86,6 +104,38 @@ async def fetch_pages(
     return list(await asyncio.gather(*(one(p) for p in pages)))
 
 
+async def fetch_scripts(
+    results: list[PageResult],
+    fetcher: PageFetcher,
+    *,
+    concurrency: int = 4,
+    clock: Callable[[], datetime] = utcnow,
+) -> dict[str, FetchedScript]:
+    """Fetch and hash every external script the pages reference, once per URL."""
+    urls = sorted(
+        {
+            parsed.src
+            for result in results
+            if result.inventory is not None
+            for parsed in result.inventory.scripts
+            if parsed.src is not None
+        }
+    )
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def one(url: str) -> tuple[str, FetchedScript]:
+        async with semaphore:
+            fetched_at = clock()
+            fetched = await fetcher.fetch_script(url)
+        digest = None
+        if fetched.outcome is ScriptFetchOutcome.OK and fetched.body is not None:
+            digest = await asyncio.to_thread(digest_body, fetched.body, fetched.content_type)
+            fetched.body = None  # the digest keeps what is stored; free the bytes early
+        return url, FetchedScript(fetched, digest, fetched_at)
+
+    return dict(await asyncio.gather(*(one(url) for url in urls)))
+
+
 def _status(results: list[PageResult]) -> ScanStatus:
     failed = sum(r.fetch.outcome.failed for r in results)
     if failed == 0:
@@ -102,14 +152,33 @@ async def record_scan(
     *,
     trigger: ScanTrigger,
     started_at: datetime,
+    scripts: Mapping[str, FetchedScript] | None = None,
     clock: Callable[[], datetime] = utcnow,
 ) -> Scan:
-    """Write a scan and its snapshots, and upsert the site's script inventory."""
+    """Write a scan, its snapshots and script fetches, and upsert the inventory and versions.
+
+    ``scripts`` holds the external scripts fetched for this scan, by URL. An external
+    script missing from it is recorded without a version (its integrity is ``unverified``).
+    """
+    scripts = scripts or {}
     existing = {
         s.locator: s for s in await session.scalars(select(Script).where(Script.site_id == site.id))
     }
     live_pages = set(
         await session.scalars(select(Page.id).where(Page.id.in_([r.page_id for r in results])))
+    )
+    inline_digests = {
+        id(parsed): digest_body(parsed.body.encode("utf-8"))
+        for result in results
+        if result.inventory is not None
+        for parsed in result.inventory.scripts
+        if parsed.body is not None
+    }
+    recorder = await VersionRecorder.load(
+        session,
+        site.id,
+        [d.sha384 for d in inline_digests.values()]
+        + [f.digest.sha384 for f in scripts.values() if f.digest is not None],
     )
     scan = Scan(
         site_id=site.id,
@@ -120,10 +189,44 @@ async def record_scan(
         pages_ok=sum(r.fetch.outcome is SnapshotOutcome.OK for r in results),
         pages_failed=sum(r.fetch.outcome.failed for r in results),
         pages_skipped=sum(r.fetch.outcome is SnapshotOutcome.ROBOTS_DISALLOWED for r in results),
+        scripts_fetched=0,
+        scripts_fetch_failed=0,
     )
     session.add(scan)
     seen: set[str] = set()
     new: set[str] = set()
+    new_versions: set[uuid.UUID] = set()
+    changed: set[uuid.UUID] = set()
+    # External scripts: their version for this scan, recorded once per URL.
+    external: dict[str, tuple[Script, ScriptVersion | None]] = {}
+
+    def upsert_script(locator: str, parsed: ParsedScript, seen_at: datetime) -> Script:
+        script = existing.get(locator)
+        if script is None:
+            script = Script(
+                id=uuid.uuid4(),
+                site_id=site.id,
+                kind=ScriptKind.INLINE if parsed.is_inline else ScriptKind.EXTERNAL,
+                locator=locator,
+                first_seen_at=seen_at,
+                last_seen_at=seen_at,
+            )
+            session.add(script)
+            existing[locator] = script
+            new.add(locator)
+        else:
+            script.last_seen_at = max(script.last_seen_at, seen_at)
+        seen.add(locator)
+        return script
+
+    def record_version(script: Script, digest: BodyDigest, seen_at: datetime) -> ScriptVersion:
+        recorded = recorder.record(session, script, digest, seen_at)
+        if recorded.new_version:
+            new_versions.add(recorded.version.id)
+        if recorded.changed:
+            changed.add(script.id)
+        return recorded.version
+
     for result in sorted(results, key=lambda r: r.url):
         fetch = result.fetch
         inventory = result.inventory
@@ -144,6 +247,8 @@ async def record_scan(
             warnings=list(inventory.warnings) if inventory else [],
             script_count=len(inventory.scripts) if inventory else 0,
             data_block_count=inventory.data_blocks if inventory else 0,
+            security_headers=dict(fetch.security_headers),
+            meta_csp=list(inventory.meta_csp) if inventory else [],
             fetched_at=result.fetched_at,
         )
         session.add(snapshot)
@@ -152,21 +257,27 @@ async def record_scan(
         page_url = fetch.final_url or result.url
         for parsed in inventory.scripts:
             locator = locator_for(page_url, parsed)
-            script = existing.get(locator)
-            if script is None:
-                script = Script(
-                    site_id=site.id,
-                    kind=ScriptKind.INLINE if parsed.is_inline else ScriptKind.EXTERNAL,
-                    locator=locator,
-                    first_seen_at=result.fetched_at,
-                    last_seen_at=result.fetched_at,
-                )
-                session.add(script)
-                existing[locator] = script
-                new.add(locator)
+            script = upsert_script(locator, parsed, result.fetched_at)
+            version: ScriptVersion | None = None
+            sri_status: SriStatus | None = None
+            if parsed.body is not None:
+                version = record_version(script, inline_digests[id(parsed)], result.fetched_at)
             else:
-                script.last_seen_at = max(script.last_seen_at, result.fetched_at)
-            seen.add(locator)
+                assert parsed.src is not None
+                if parsed.src not in external:
+                    fetched = scripts.get(parsed.src)
+                    if fetched is not None and fetched.digest is not None:
+                        version = record_version(script, fetched.digest, fetched.fetched_at)
+                    external[parsed.src] = (script, version)
+                version = external[parsed.src][1]
+                if parsed.integrity is not None:
+                    fetched = scripts.get(parsed.src)
+                    if version is None or fetched is None or fetched.digest is None:
+                        sri_status = SriStatus.UNVERIFIED
+                    else:
+                        sri_status = check_integrity_digests(
+                            parsed.integrity, fetched.digest.digests
+                        )
             session.add(
                 ScriptObservation(
                     snapshot=snapshot,
@@ -183,10 +294,42 @@ async def record_scan(
                     nomodule=parsed.nomodule,
                     inline_sha384=parsed.body_sha384,
                     inline_size_bytes=parsed.body_size,
+                    version=version,
+                    sri_status=sri_status,
                 )
             )
+
+    for url, (script, version) in sorted(external.items()):
+        fetched = scripts.get(url)
+        if fetched is None:
+            continue
+        sf = fetched.fetch
+        session.add(
+            ScriptFetch(
+                scan=scan,
+                script=script,
+                version=version,
+                url=url,
+                outcome=sf.outcome,
+                final_url=sf.final_url,
+                http_status=sf.status_code,
+                content_type=(sf.content_type or "")[:255] or None,
+                size_bytes=fetched.digest.size_bytes if fetched.digest else None,
+                elapsed_ms=sf.elapsed_ms,
+                error=sf.error[:1024] if sf.error else None,
+                new_version=version is not None and version.id in new_versions,
+                fetched_at=fetched.fetched_at,
+            )
+        )
+        if sf.outcome is ScriptFetchOutcome.OK:
+            scan.scripts_fetched += 1
+        else:
+            scan.scripts_fetch_failed += 1
+
     scan.scripts_seen = len(seen)
     scan.scripts_new = len(new)
+    scan.versions_new = len(new_versions)
+    scan.scripts_changed = len(changed)
     scan.finished_at = clock()
     await session.flush()
     return scan
@@ -203,8 +346,8 @@ async def scan_site(
 ) -> Scan:
     """Scan every registered page of a site and record the result.
 
-    The caller owns the transaction. Reads happen up front, the network phase holds no
-    locks, and all writes happen at the end.
+    The caller owns the transaction. Reads happen up front, the network phase (pages, then
+    the external scripts they reference) holds no locks, and all writes happen at the end.
     """
     site = await get_site(session, site_name)
     pages = await list_pages(session, site_name)
@@ -215,8 +358,15 @@ async def scan_site(
         )
     started_at = clock()
     results = await fetch_pages(site, pages, fetcher, concurrency=concurrency, clock=clock)
+    scripts = await fetch_scripts(results, fetcher, concurrency=concurrency, clock=clock)
     return await record_scan(
-        session, site, results, trigger=trigger, started_at=started_at, clock=clock
+        session,
+        site,
+        results,
+        trigger=trigger,
+        started_at=started_at,
+        scripts=scripts,
+        clock=clock,
     )
 
 
@@ -231,6 +381,15 @@ async def list_scans(session: AsyncSession, site_name: str, *, limit: int = 20) 
     return list(result)
 
 
+# Loaded with a scan's observations and fetches; bodies stay in the database.
+_VERSION_SUMMARY = (
+    ScriptVersion.id,
+    ScriptVersion.script_id,
+    ScriptVersion.sha384,
+    ScriptVersion.size_bytes,
+)
+
+
 async def get_scan(session: AsyncSession, scan_id: uuid.UUID) -> tuple[Scan, str]:
     """A scan with its snapshots and observations loaded, and its site's name."""
     row = (
@@ -241,7 +400,15 @@ async def get_scan(session: AsyncSession, scan_id: uuid.UUID) -> tuple[Scan, str
             .options(
                 selectinload(Scan.snapshots)
                 .selectinload(PageSnapshot.observations)
-                .selectinload(ScriptObservation.script)
+                .selectinload(ScriptObservation.script),
+                selectinload(Scan.snapshots)
+                .selectinload(PageSnapshot.observations)
+                .selectinload(ScriptObservation.version)
+                .load_only(*_VERSION_SUMMARY),
+                selectinload(Scan.script_fetches).selectinload(ScriptFetch.script),
+                selectinload(Scan.script_fetches)
+                .selectinload(ScriptFetch.version)
+                .load_only(*_VERSION_SUMMARY),
             )
         )
     ).one_or_none()

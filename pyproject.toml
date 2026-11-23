@@ -65,7 +65,7 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "typer.Option", "t
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "examples"]
 plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]

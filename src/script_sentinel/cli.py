@@ -6,16 +6,30 @@ import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Annotated, Any
 
 import typer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from script_sentinel import __version__, scanner, sites
+from script_sentinel import __version__, scanner, sites, versions
 from script_sentinel.config import Settings
 from script_sentinel.db import make_engine, make_sessionmaker
-from script_sentinel.db.models import PageSnapshot, Scan, ScanStatus, ScanTrigger, SnapshotOutcome
+from script_sentinel.db.models import (
+    PageSnapshot,
+    Scan,
+    ScanStatus,
+    ScanTrigger,
+    Script,
+    ScriptFetchOutcome,
+    ScriptKind,
+    ScriptObservation,
+    ScriptVersion,
+    SnapshotOutcome,
+    SriStatus,
+)
 from script_sentinel.fetch import PageFetcher
+from script_sentinel.headers import describe as describe_headers
 
 app = typer.Typer(
     help="script-sentinel: integrity monitoring for the third-party scripts your pages load.",
@@ -322,8 +336,30 @@ def _scan_json(scan: Scan, site_name: str) -> dict[str, Any]:
             "skipped": scan.pages_skipped,
             "failed": scan.pages_failed,
         },
-        "scripts": {"seen": scan.scripts_seen, "new": scan.scripts_new},
+        "scripts": {
+            "seen": scan.scripts_seen,
+            "new": scan.scripts_new,
+            "fetched": scan.scripts_fetched,
+            "fetch_failed": scan.scripts_fetch_failed,
+            "versions_new": scan.versions_new,
+            "changed": scan.scripts_changed,
+        },
         "snapshots": [_snapshot_json(snap) for snap in scan.snapshots],
+        "script_fetches": [
+            {
+                "url": f.url,
+                "outcome": f.outcome.value,
+                "http_status": f.http_status,
+                "final_url": f.final_url,
+                "content_type": f.content_type,
+                "size_bytes": f.size_bytes,
+                "error": f.error,
+                "sha384": f.version.sha384 if f.version else None,
+                "sri": f.version.sri if f.version else None,
+                "new_version": f.new_version,
+            }
+            for f in scan.script_fetches
+        ],
     }
 
 
@@ -337,6 +373,8 @@ def _snapshot_json(snap: PageSnapshot) -> dict[str, Any]:
         "elapsed_ms": snap.elapsed_ms,
         "error": snap.error,
         "warnings": snap.warnings,
+        "security_headers": snap.security_headers,
+        "meta_csp": snap.meta_csp,
         "scripts": [
             {
                 "position": obs.position,
@@ -346,13 +384,60 @@ def _snapshot_json(snap: PageSnapshot) -> dict[str, Any]:
                 "integrity": obs.integrity,
                 "has_nonce": obs.nonce_digest is not None,
                 "inline_sha384": obs.inline_sha384,
+                "sha384": obs.version.sha384 if obs.version else None,
+                "sri": obs.version.sri if obs.version else None,
+                "sri_status": obs.sri_status.value if obs.sri_status else None,
             }
             for obs in snap.observations
         ],
     }
 
 
-def _print_scan(scan: Scan, site_name: str, new_locators: set[str]) -> None:
+_SRI_LABEL = {
+    SriStatus.MATCH: "integrity ok",
+    SriStatus.MISMATCH: "INTEGRITY MISMATCH",
+    SriStatus.NO_SUPPORTED_HASH: "integrity unusable",
+    SriStatus.UNVERIFIED: "integrity unverified",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _Changes:
+    """What a scan saw for the first time (only known right after running it)."""
+
+    new_locators: set[str] = field(default_factory=set)
+    changed_scripts: set[uuid.UUID] = field(default_factory=set)
+
+
+def _short(sri: str, width: int = 22) -> str:
+    return sri if len(sri) <= width else sri[:width] + "…"
+
+
+def _observation_line(
+    obs: ScriptObservation, failed: dict[uuid.UUID, str], changes: _Changes
+) -> str:
+    if obs.script.locator in changes.new_locators:
+        marker = "+"
+    elif obs.script_id in changes.changed_scripts:
+        marker = "~"
+    elif obs.script_id in failed:
+        marker = "!"
+    else:
+        marker = " "
+    extras = [obs.script_type.value]
+    if obs.sri_status is not None:
+        extras.append(_SRI_LABEL[obs.sri_status])
+    elif obs.integrity:
+        extras.append("integrity")
+    if obs.nonce_digest:
+        extras.append("nonce")
+    if obs.script_id in failed:
+        extras.append(f"not fetched: {failed[obs.script_id]}")
+    body = f"  {_short(obs.version.sri)}" if obs.version else ""
+    return f"      {marker} {obs.script.locator}  ({', '.join(extras)}){body}"
+
+
+def _print_scan(scan: Scan, site_name: str, changes: _Changes) -> None:
     elapsed = (
         f" in {(scan.finished_at - scan.started_at).total_seconds():.2f}s"
         if scan.finished_at
@@ -367,29 +452,35 @@ def _print_scan(scan: Scan, site_name: str, new_locators: set[str]) -> None:
         f"scan {scan.id} of {site_name}: {scan.status.value}{elapsed} "
         f"({scan.pages_total} pages: {', '.join(parts)})"
     )
+    failed = {
+        f.script_id: f.error or f.outcome.value
+        for f in scan.script_fetches
+        if f.outcome is not ScriptFetchOutcome.OK
+    }
+    mismatched = 0
     for snap in scan.snapshots:
         label = _OUTCOME_LABEL[snap.outcome]
         flag = " [payment]" if snap.payment_page else ""
         if snap.outcome is SnapshotOutcome.OK:
-            fresh = sum(1 for o in snap.observations if o.script.locator in new_locators)
+            fresh = sum(1 for o in snap.observations if o.script.locator in changes.new_locators)
             typer.echo(
                 f"  {label:<8} {snap.url}{flag}  {snap.http_status}  "
                 f"{len(snap.observations)} scripts" + (f" ({fresh} new)" if fresh else "")
             )
+            typer.echo(f"      headers: {describe_headers(snap.security_headers, snap.meta_csp)}")
             for obs in snap.observations:
-                marker = "+" if obs.script.locator in new_locators else " "
-                extras = [obs.script_type.value]
-                if obs.integrity:
-                    extras.append("integrity")
-                if obs.nonce_digest:
-                    extras.append("nonce")
-                typer.echo(f"      {marker} {obs.script.locator}  ({', '.join(extras)})")
+                typer.echo(_observation_line(obs, failed, changes))
+                mismatched += obs.sri_status is SriStatus.MISMATCH
             for warning in snap.warnings:
                 typer.echo(f"      ! {warning}")
         else:
             typer.echo(f"  {label:<8} {snap.url}{flag}  {snap.error}")
     typer.echo(
         f"inventory: {scan.scripts_seen} scripts seen, {scan.scripts_new} new (pending approval)"
+    )
+    typer.echo(
+        f"bodies: {scan.scripts_fetched} external fetched, {scan.scripts_fetch_failed} failed; "
+        f"{scan.versions_new} new versions, {scan.scripts_changed} scripts changed"
     )
     skipped_payment = [
         s.url
@@ -400,6 +491,20 @@ def _print_scan(scan: Scan, site_name: str, new_locators: set[str]) -> None:
         typer.secho(
             "warning: robots.txt kept payment pages out of this scan; if they are your own "
             f"pages, run: sentinel sites update {site_name} --ignore-robots",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+    if mismatched:
+        typer.secho(
+            f"warning: {mismatched} script tags fail their integrity check; "
+            "browsers will refuse to run them",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+    if failed:
+        typer.secho(
+            f"warning: {len(failed)} external scripts could not be fetched, so their "
+            "integrity was not checked this scan",
             fg=typer.colors.YELLOW,
             err=True,
         )
@@ -417,8 +522,10 @@ def scan_run(
     """
     settings = Settings()
 
-    async def work(session: AsyncSession) -> tuple[Scan, str, set[str]]:
-        before = {s.locator for s in await scanner.list_scripts(session, site)}
+    async def work(session: AsyncSession) -> tuple[Scan, str, _Changes]:
+        known = await scanner.list_scripts(session, site)
+        before = {s.locator for s in known}
+        known_versions = await versions.versions_by_script(session, [s.id for s in known])
         async with PageFetcher(settings.fetch_limits()) as fetcher:
             scan = await scanner.scan_site(
                 session,
@@ -429,13 +536,21 @@ def scan_run(
             )
         detailed, name = await scanner.get_scan(session, scan.id)
         after = {s.locator for s in await scanner.list_scripts(session, site)}
-        return detailed, name, after - before
+        changed = {
+            obs.script_id
+            for snap in detailed.snapshots
+            for obs in snap.observations
+            if obs.version_id is not None
+            and known_versions.get(obs.script_id)
+            and obs.version_id not in {v.id for v in known_versions[obs.script_id]}
+        }
+        return detailed, name, _Changes(after - before, changed)
 
-    scan, name, new_locators = _run(url, work)
+    scan, name, changes = _run(url, work)
     if as_json:
         typer.echo(json.dumps(_scan_json(scan, name), indent=2))
     else:
-        _print_scan(scan, name, new_locators)
+        _print_scan(scan, name, changes)
     if scan.status is not ScanStatus.COMPLETED:
         raise typer.Exit(code=EXIT_SCAN_INCOMPLETE)
 
@@ -505,24 +620,42 @@ def scan_show(
     if as_json:
         typer.echo(json.dumps(_scan_json(scan, name), indent=2))
     else:
-        _print_scan(scan, name, set())
+        _print_scan(scan, name, _Changes())
+
+
+def _version_json(version: ScriptVersion) -> dict[str, Any]:
+    return {
+        "id": str(version.id),
+        "sha384": version.sha384,
+        "normalized_sha384": version.normalized_sha384,
+        "sri": version.sri,
+        "size_bytes": version.size_bytes,
+        "first_seen_at": version.first_seen_at.isoformat(),
+        "last_seen_at": version.last_seen_at.isoformat(),
+    }
+
+
+def _script_json(script: Script, history: list[ScriptVersion]) -> dict[str, Any]:
+    return {
+        "id": str(script.id),
+        "kind": script.kind.value,
+        "locator": script.locator,
+        "status": script.status.value,
+        "first_seen_at": script.first_seen_at.isoformat(),
+        "last_seen_at": script.last_seen_at.isoformat(),
+        "version_count": len(history),
+        "current_sri": history[0].sri if history else None,
+    }
 
 
 @scripts_app.command("list")
 def scripts_list(site: str, as_json: JsonOutput = False, url: DatabaseURL = None) -> None:
-    """List every script ever seen on a site, with its authorization status."""
+    """List every script ever seen on a site, with its status and current SRI value."""
 
     async def work(session: AsyncSession) -> list[dict[str, Any]]:
-        return [
-            {
-                "kind": s.kind.value,
-                "locator": s.locator,
-                "status": s.status.value,
-                "first_seen_at": s.first_seen_at.isoformat(),
-                "last_seen_at": s.last_seen_at.isoformat(),
-            }
-            for s in await scanner.list_scripts(session, site)
-        ]
+        scripts = await scanner.list_scripts(session, site)
+        by_script = await versions.versions_by_script(session, [s.id for s in scripts])
+        return [_script_json(s, by_script[s.id]) for s in scripts]
 
     scripts = _run(url, work)
     if as_json:
@@ -532,4 +665,55 @@ def scripts_list(site: str, as_json: JsonOutput = False, url: DatabaseURL = None
         typer.echo(f"no scripts recorded for {site} yet; run: sentinel scan run {site}")
         return
     for s in scripts:
-        typer.echo(f"{s['status']:<9} {s['kind']:<9} {s['locator']}")
+        sri = _short(s["current_sri"]) if s["current_sri"] else "(no body yet)"
+        count = f"v{s['version_count']}"
+        typer.echo(f"{s['status']:<9} {s['kind']:<9} {count:<4} {sri:<25} {s['locator']}")
+
+
+@scripts_app.command("show")
+def scripts_show(
+    site: str,
+    locator: Annotated[str, typer.Argument(help="The script's src URL, or PAGE#inline-N.")],
+    as_json: JsonOutput = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Show a script's version history, with the SRI value (or CSP hash) of each body."""
+
+    async def work(session: AsyncSession) -> tuple[Script, list[ScriptVersion]]:
+        script = await versions.find_script(session, site, locator)
+        history = (await versions.versions_by_script(session, [script.id]))[script.id]
+        return script, history
+
+    script, history = _run(url, work)
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {**_script_json(script, history), "versions": [_version_json(v) for v in history]},
+                indent=2,
+            )
+        )
+        return
+    typer.echo(f"{script.locator}")
+    typer.echo(f"  kind: {script.kind.value}   status: {script.status.value}")
+    typer.echo(
+        f"  seen: {script.first_seen_at:%Y-%m-%d %H:%M:%S}Z .. "
+        f"{script.last_seen_at:%Y-%m-%d %H:%M:%S}Z"
+    )
+    if not history:
+        typer.echo("  no body recorded yet (the script could not be fetched)")
+        return
+    typer.echo(f"  versions ({len(history)}, most recently seen first):")
+    for version in history:
+        typer.echo(
+            f"    {version.last_seen_at:%Y-%m-%d %H:%M:%S}Z  {version.size_bytes:>8} bytes  "
+            f"{version.sri}"
+        )
+    current = history[0]
+    if script.kind is ScriptKind.EXTERNAL:
+        typer.echo("  pin the current body with:")
+        typer.echo(
+            f'    <script src="{script.locator}" integrity="{current.sri}" '
+            'crossorigin="anonymous"></script>'
+        )
+    else:
+        typer.echo(f"  CSP hash source for the current body: '{current.sri}'")

@@ -17,6 +17,10 @@ It follows the HTML standard where it changes the answer:
 * a ``data:`` URL in ``src`` is code embedded in the page, so it is treated as an inline
   script with the decoded body.
 
+It also records any Content Security Policy set with ``<meta http-equiv>``, and warns about
+an ``integrity`` attribute on a cross-origin script without ``crossorigin``: the request is
+then made in no-cors mode, the response is opaque, and browsers refuse to run the script.
+
 Anything that can't be inventoried (``javascript:`` or ``blob:`` sources, an empty ``src``,
 an undecodable ``data:`` URL) is reported as a warning rather than silently dropped.
 
@@ -34,7 +38,7 @@ from html.parser import HTMLParser
 from urllib.parse import unquote_to_bytes, urldefrag, urljoin, urlsplit
 
 from script_sentinel.db.models import ScriptType
-from script_sentinel.origins import MAX_URL_LENGTH
+from script_sentinel.origins import MAX_URL_LENGTH, InvalidUrlError, origin_of
 
 # https://mimesniff.spec.whatwg.org/#javascript-mime-type
 JAVASCRIPT_MIME_TYPES = frozenset(
@@ -115,6 +119,8 @@ class PageInventory:
     warnings: list[str] = field(default_factory=list)
     base_url: str = ""
     data_blocks: int = 0  # <script> elements with a non-code type, which never run
+    # Policies from <meta http-equiv="Content-Security-Policy" content="...">.
+    meta_csp: list[str] = field(default_factory=list)
 
 
 def classify_type(type_attribute: str | None, language: str | None = None) -> ScriptType | None:
@@ -164,6 +170,7 @@ class _ScriptParser(HTMLParser):
     def __init__(self, page_url: str) -> None:
         super().__init__(convert_charrefs=True)
         self.inventory = PageInventory(base_url=page_url)
+        self._page_origin = _origin_or_none(page_url)
         self._base_seen = False
         self._inert_depth = 0
         self._svg_depth = 0
@@ -182,6 +189,8 @@ class _ScriptParser(HTMLParser):
             self._svg_depth += 1
         elif tag == "base" and not self._base_seen:
             self._set_base(dict(attrs))
+        elif tag == "meta" and self._inert_depth == 0:
+            self._meta(dict(attrs))
         elif tag == "script":
             self._open = dict(attrs)
             self._open_in_svg = self._svg_depth > 0
@@ -221,6 +230,12 @@ class _ScriptParser(HTMLParser):
             self.inventory.base_url = resolved
         else:
             self.inventory.warnings.append(f"ignored <base href> with scheme: {href[:80]}")
+
+    def _meta(self, attrs: dict[str, str | None]) -> None:
+        equiv = (attrs.get("http-equiv") or "").strip().lower()
+        content = (attrs.get("content") or "").strip()
+        if equiv == "content-security-policy" and content:
+            self.inventory.meta_csp.append(content[:8192])
 
     def _finish_script(self, attrs: dict[str, str | None], body: str) -> None:
         script_type = classify_type(attrs.get("type"), attrs.get("language"))
@@ -276,6 +291,18 @@ class _ScriptParser(HTMLParser):
         if src is None:
             self._inline += 1
             inline_index = self._inline
+        integrity = _clean(attrs.get("integrity"))
+        crossorigin = _flag_value(attrs, "crossorigin")
+        if (
+            src is not None
+            and integrity is not None
+            and crossorigin is None
+            and _origin_or_none(src) != self._page_origin
+        ):
+            self.inventory.warnings.append(
+                f"integrity on cross-origin script {src[:200]} without a crossorigin "
+                "attribute: browsers will refuse to run it"
+            )
         self.inventory.scripts.append(
             ParsedScript(
                 position=self._position,
@@ -284,8 +311,8 @@ class _ScriptParser(HTMLParser):
                 src=src,
                 body=body,
                 inline_index=inline_index,
-                integrity=_clean(attrs.get("integrity")),
-                crossorigin=_flag_value(attrs, "crossorigin"),
+                integrity=integrity,
+                crossorigin=crossorigin,
                 referrerpolicy=_clean(attrs.get("referrerpolicy")),
                 nonce=attrs.get("nonce") or None,
                 is_async="async" in attrs,
@@ -294,6 +321,13 @@ class _ScriptParser(HTMLParser):
                 in_svg=self._open_in_svg,
             )
         )
+
+
+def _origin_or_none(url: str) -> str | None:
+    try:
+        return str(origin_of(url))
+    except InvalidUrlError:
+        return None
 
 
 def _clean(value: str | None) -> str | None:

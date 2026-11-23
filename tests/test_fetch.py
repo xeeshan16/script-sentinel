@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable, Coroutine
 import httpx
 import pytest
 
-from script_sentinel.db.models import SnapshotOutcome
+from script_sentinel.db.models import ScriptFetchOutcome, SnapshotOutcome
 from script_sentinel.fetch import FetchLimits, PageFetcher, decode_html
 from script_sentinel.robots import MAX_ROBOTS_BYTES
 from tests.conftest import FixtureSite
@@ -325,3 +325,154 @@ async def test_robots_body_is_capped() -> None:
     async with mock_fetcher(handler) as fetcher:
         policy = await fetcher.robots_policy(f"{SHOP}/", ALLOWED)
     assert policy.can_fetch("/late")
+
+
+async def test_a_redirect_httpx_cannot_parse_is_a_failed_page_not_a_crash() -> None:
+    handler = routes(
+        {
+            f"{SHOP}/robots.txt": httpx.Response(302, headers={"location": "data:x,1"}),
+            f"{SHOP}/": httpx.Response(302, headers={"location": "data:text/html,hi"}),
+        }
+    )
+    async with mock_fetcher(handler) as fetcher:
+        result = await fetcher.fetch_page(f"{SHOP}/", ALLOWED, respect_robots=False)
+        robots = await fetcher.robots_policy(f"{SHOP}/", ALLOWED)
+    assert result.outcome is SnapshotOutcome.FETCH_ERROR
+    assert result.error is not None
+    assert result.error.startswith("InvalidURL: ")
+    assert not robots.can_fetch(f"{SHOP}/")
+    assert robots.source == "unreachable (InvalidURL)"
+
+
+# Security headers
+
+
+async def test_page_security_headers_are_captured() -> None:
+    page = httpx.Response(
+        200,
+        headers=[
+            ("content-type", "text/html"),
+            ("content-security-policy", "script-src 'self'"),
+            ("content-security-policy", "object-src 'none'"),
+            ("x-frame-options", "DENY"),
+            ("set-cookie", "session=secret"),
+        ],
+        text="<p>hi</p>",
+    )
+    handler = routes({f"{SHOP}/robots.txt": httpx.Response(404), f"{SHOP}/": page})
+    async with mock_fetcher(handler) as fetcher:
+        result = await fetcher.fetch_page(f"{SHOP}/", ALLOWED)
+    assert result.security_headers == {
+        "content-security-policy": ["script-src 'self'", "object-src 'none'"],
+        "x-frame-options": ["DENY"],
+    }
+
+
+# External scripts
+
+CDN = "https://cdn.vendor.test"
+
+
+def js(
+    body: bytes = b"run();", status: int = 200, headers: dict[str, str] | None = None
+) -> httpx.Response:
+    return httpx.Response(
+        status, headers={"content-type": "text/javascript", **(headers or {})}, content=body
+    )
+
+
+async def test_fetch_script_from_the_fixture_site(fixture_site: FixtureSite) -> None:
+    fixture_site.set("/w.js", b"widget();", content_type="text/javascript")
+    async with PageFetcher() as fetcher:
+        result = await fetcher.fetch_script(fixture_site.url("/w.js"))
+    assert result.outcome is ScriptFetchOutcome.OK
+    assert (result.status_code, result.body, result.content_type) == (
+        200,
+        b"widget();",
+        "text/javascript",
+    )
+    assert result.final_url == fixture_site.url("/w.js")
+    # robots.txt is never consulted for a subresource.
+    assert fixture_site.paths() == ["/w.js"]
+
+
+async def test_fetch_script_follows_redirects_to_any_http_origin() -> None:
+    handler = routes(
+        {
+            f"{CDN}/latest/w.js": httpx.Response(302, headers={"location": "/v2/w.js"}),
+            f"{CDN}/v2/w.js": httpx.Response(
+                301, headers={"location": "https://mirror.test/v2/w.js"}
+            ),
+            "https://mirror.test/v2/w.js": js(b"v2();"),
+            f"{CDN}/ftp": httpx.Response(302, headers={"location": "ftp://cdn.vendor.test/w.js"}),
+            f"{CDN}/bad": httpx.Response(302, headers={"location": "data:text/javascript,1"}),
+            f"{CDN}/loop": httpx.Response(302, headers={"location": "/loop"}),
+        }
+    )
+    async with mock_fetcher(handler, max_redirects=3) as fetcher:
+        moved = await fetcher.fetch_script(f"{CDN}/latest/w.js")
+        ftp = await fetcher.fetch_script(f"{CDN}/ftp")
+        bad = await fetcher.fetch_script(f"{CDN}/bad")
+        loop = await fetcher.fetch_script(f"{CDN}/loop")
+    assert moved.outcome is ScriptFetchOutcome.OK
+    assert moved.body == b"v2();"
+    assert moved.final_url == "https://mirror.test/v2/w.js"
+    assert moved.redirects == [f"{CDN}/v2/w.js", "https://mirror.test/v2/w.js"]
+    assert ftp.outcome is ScriptFetchOutcome.BAD_REDIRECT
+    assert ftp.error == "redirected to a non-http(s) URL: ftp://cdn.vendor.test/w.js"
+    # httpx refuses some Location values outright; that is a failed fetch, not a crash.
+    assert bad.outcome is ScriptFetchOutcome.FETCH_ERROR
+    assert bad.error is not None
+    assert bad.error.startswith("InvalidURL: ")
+    assert loop.outcome is ScriptFetchOutcome.FETCH_ERROR
+    assert loop.error == "more than 3 redirects"
+
+
+async def test_fetch_script_failures() -> None:
+    async def stall(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        return js()  # pragma: no cover - cancelled by the deadline
+
+    handler = routes(
+        {
+            f"{CDN}/gone.js": js(b"", 404),
+            f"{CDN}/odd.js": js(b"", 199),
+            f"{CDN}/big.js": js(b"x" * 2048),
+            f"{CDN}/declared.js": js(b"", headers={"content-length": "999999"}),
+            f"{CDN}/slow.js": httpx.ReadTimeout("read timed out"),
+            f"{CDN}/down.js": httpx.ConnectError("connection refused"),
+        }
+    )
+    async with mock_fetcher(handler, max_script_bytes=1024) as fetcher:
+        gone = await fetcher.fetch_script(f"{CDN}/gone.js")
+        odd = await fetcher.fetch_script(f"{CDN}/odd.js")
+        big = await fetcher.fetch_script(f"{CDN}/big.js")
+        declared = await fetcher.fetch_script(f"{CDN}/declared.js")
+        slow = await fetcher.fetch_script(f"{CDN}/slow.js")
+        down = await fetcher.fetch_script(f"{CDN}/down.js")
+    assert (gone.outcome, gone.error, gone.status_code) == (
+        ScriptFetchOutcome.HTTP_ERROR,
+        "HTTP 404",
+        404,
+    )
+    assert odd.outcome is ScriptFetchOutcome.HTTP_ERROR
+    assert big.outcome is declared.outcome is ScriptFetchOutcome.TOO_LARGE
+    assert big.error is not None
+    assert "SENTINEL_MAX_SCRIPT_BYTES" in big.error
+    assert big.body is None
+    assert slow.error == "timed out (ReadTimeout)"
+    assert down.error == "ConnectError: connection refused"
+    async with mock_fetcher(stall, timeout_seconds=0.05) as fetcher:
+        stalled = await fetcher.fetch_script(f"{CDN}/w.js")
+    assert stalled.outcome is ScriptFetchOutcome.FETCH_ERROR
+    assert stalled.error == "timed out after 0.05s"
+
+
+async def test_fetch_script_elapsed_time() -> None:
+    ticks = iter([1.0, 1.5])
+    fetcher = PageFetcher(
+        transport=httpx.MockTransport(routes({f"{CDN}/w.js": js()})), clock=lambda: next(ticks)
+    )
+    async with fetcher:
+        result = await fetcher.fetch_script(f"{CDN}/w.js")
+    assert result.elapsed_ms == 500

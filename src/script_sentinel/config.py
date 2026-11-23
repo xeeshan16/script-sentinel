@@ -53,6 +53,12 @@ class Settings(BaseSettings):
         le=64 * 1024 * 1024,
         description="Pages larger than this are reported as too_large instead of parsed.",
     )
+    max_script_bytes: int = Field(
+        default=5 * 1024 * 1024,
+        ge=1024,
+        le=64 * 1024 * 1024,
+        description="External scripts larger than this are reported as too_large, not hashed.",
+    )
     max_redirects: int = Field(default=5, ge=0, le=20)
     scan_concurrency: int = Field(
         default=4, ge=1, le=64, description="Pages fetched at once during a scan."
@@ -66,4 +72,5 @@ class Settings(BaseSettings):
             max_page_bytes=self.max_page_bytes,
             max_redirects=self.max_redirects,
             user_agent=self.user_agent,
+            max_script_bytes=self.max_script_bytes,
         )

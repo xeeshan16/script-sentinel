@@ -130,3 +130,14 @@ def fixture_site() -> Iterator[FixtureSite]:
         yield site
     finally:
         site.stop()
+
+
+@pytest.fixture
+def cdn() -> Iterator[FixtureSite]:
+    """A second local server: a different origin, standing in for a vendor's CDN."""
+    site = FixtureSite()
+    site.start()
+    try:
+        yield site
+    finally:
+        site.stop()

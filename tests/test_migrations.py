@@ -21,6 +21,7 @@ TABLES = {
     "scans",
     "page_snapshots",
     "script_observations",
+    "script_fetches",
 }
 
 
@@ -66,4 +67,4 @@ def test_upgrade_and_downgrade_round_trip(database_url: str) -> None:
 
 def test_current_prints_the_revision(sqlite_url: str, capsys: pytest.CaptureFixture[str]) -> None:
     migrate.current(sqlite_url)
-    assert "0002" in capsys.readouterr().out
+    assert "0003" in capsys.readouterr().out

@@ -12,9 +12,12 @@ from script_sentinel.db.models import (
     AuthorizationStatus,
     ScanStatus,
     ScanTrigger,
+    ScriptFetchOutcome,
     ScriptKind,
     ScriptType,
+    ScriptVersion,
     SnapshotOutcome,
+    SriStatus,
 )
 
 
@@ -103,6 +106,10 @@ class ScanOut(BaseModel):
     pages_failed: int
     scripts_seen: int
     scripts_new: int
+    scripts_fetched: int
+    scripts_fetch_failed: int
+    versions_new: int
+    scripts_changed: int
 
 
 class ScanList(BaseModel):
@@ -126,6 +133,15 @@ class ObservationOut(BaseModel):
     nomodule: bool
     inline_sha384: str | None
     inline_size_bytes: int | None
+    version_id: uuid.UUID | None = Field(description="The body this page got, if known.")
+    sha384: str | None = Field(description="Hex SHA-384 of that body.")
+    sri: str | None = Field(
+        description="sha384-<base64> of that body: an integrity value for external scripts, "
+        "a CSP hash source for inline ones."
+    )
+    sri_status: SriStatus | None = Field(
+        description="For scripts with an integrity attribute: what a browser would do."
+    )
 
 
 class SnapshotOut(BaseModel):
@@ -141,18 +157,58 @@ class SnapshotOut(BaseModel):
     error: str | None
     warnings: list[str]
     data_block_count: int
+    security_headers: dict[str, list[str]]
+    meta_csp: list[str]
     fetched_at: datetime
     scripts: list[ObservationOut]
+
+
+class ScriptFetchOut(BaseModel):
+    script_id: uuid.UUID
+    url: str
+    outcome: ScriptFetchOutcome
+    final_url: str | None
+    http_status: int | None
+    content_type: str | None
+    size_bytes: int | None
+    elapsed_ms: int
+    error: str | None
+    version_id: uuid.UUID | None
+    sha384: str | None
+    sri: str | None
+    new_version: bool
+    fetched_at: datetime
 
 
 class ScanDetail(ScanOut):
     site: str
     pages: list[SnapshotOut]
+    script_fetches: list[ScriptFetchOut]
+
+
+class VersionOut(BaseModel):
+    id: uuid.UUID
+    sha384: str
+    normalized_sha384: str | None
+    sri: str
+    size_bytes: int
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+    @classmethod
+    def of(cls, version: ScriptVersion) -> VersionOut:
+        return cls(
+            id=version.id,
+            sha384=version.sha384,
+            normalized_sha384=version.normalized_sha384,
+            sri=version.sri,
+            size_bytes=version.size_bytes,
+            first_seen_at=version.first_seen_at,
+            last_seen_at=version.last_seen_at,
+        )
 
 
 class ScriptOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: uuid.UUID
     kind: ScriptKind
     locator: str
@@ -160,6 +216,12 @@ class ScriptOut(BaseModel):
     justification: str | None
     first_seen_at: datetime
     last_seen_at: datetime
+    version_count: int
+    current_version: VersionOut | None = Field(description="The body seen most recently.")
+
+
+class ScriptDetail(ScriptOut):
+    versions: list[VersionOut] = Field(description="Every body seen, most recent first.")
 
 
 class ScriptList(BaseModel):

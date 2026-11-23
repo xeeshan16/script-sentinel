@@ -10,6 +10,8 @@
   A script that changes on the vendor's CDN gets a new version.
 * A **finding** is something a person should look at: an unapproved script, a changed
   body, a suspicious pattern.
+* A **script fetch** is one download of an external script during a scan: what came back
+  and which version it was.
 * A **scan** is one pass over a site's pages. Each page it fetched gets a **page
   snapshot** (what happened and when), and each script found on that page gets a **script
   observation** with the attributes it had at that moment. Snapshots are kept even after a
@@ -39,6 +41,7 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     Uuid,
+    text,
     true,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -131,6 +134,23 @@ class SnapshotOutcome(enum.StrEnum):
         return self not in (SnapshotOutcome.OK, SnapshotOutcome.ROBOTS_DISALLOWED)
 
 
+class ScriptFetchOutcome(enum.StrEnum):
+    OK = "ok"
+    HTTP_ERROR = "http_error"
+    TOO_LARGE = "too_large"
+    BAD_REDIRECT = "bad_redirect"  # redirected to something that isn't http(s)
+    FETCH_ERROR = "fetch_error"
+
+
+class SriStatus(enum.StrEnum):
+    """What a browser would do with a script's ``integrity`` attribute."""
+
+    MATCH = "match"
+    MISMATCH = "mismatch"  # the browser refuses to run the script
+    NO_SUPPORTED_HASH = "no_supported_hash"  # nothing usable: the script runs unchecked
+    UNVERIFIED = "unverified"  # the body couldn't be fetched this scan
+
+
 class ScriptType(enum.StrEnum):
     CLASSIC = "classic"
     MODULE = "module"
@@ -165,6 +185,7 @@ class Base(DeclarativeBase):
     type_annotation_map: ClassVar[dict[Any, Any]] = {
         datetime: UtcDateTime(),
         dict[str, Any]: JSONType,
+        dict[str, list[str]]: JSONType,
         list[str]: JSONType,
     }
 
@@ -242,8 +263,9 @@ class ScriptVersion(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     script_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("scripts.id", ondelete="CASCADE"))
-    # Hex digests: the exact bytes served, and the body after whitespace/comment
-    # normalization (so a re-minified but otherwise identical file can be told apart).
+    # Hex digests: the exact bytes served, and the body with comments dropped and whitespace
+    # collapsed (see jstokens.normalize), so a rebuild that only changed a banner comment or
+    # indentation can be told apart from a change in the code.
     sha384: Mapped[str] = mapped_column(String(96))
     normalized_sha384: Mapped[str | None] = mapped_column(String(96))
     size_bytes: Mapped[int] = mapped_column(Integer)
@@ -298,12 +320,25 @@ class Scan(Base):
     pages_failed: Mapped[int] = mapped_column(Integer, default=0)
     scripts_seen: Mapped[int] = mapped_column(Integer, default=0)
     scripts_new: Mapped[int] = mapped_column(Integer, default=0)
+    # External scripts downloaded (or not) this scan, and the bodies it saw.
+    scripts_fetched: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    scripts_fetch_failed: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Bodies never seen before, and how many of those belong to scripts that already had
+    # a different body (a script that changed).
+    versions_new: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    scripts_changed: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     snapshots: Mapped[list[PageSnapshot]] = relationship(
         back_populates="scan",
         cascade="all, delete-orphan",
         passive_deletes=True,
         order_by="PageSnapshot.url",
+    )
+    script_fetches: Mapped[list[ScriptFetch]] = relationship(
+        back_populates="scan",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="ScriptFetch.url",
     )
 
 
@@ -330,6 +365,12 @@ class PageSnapshot(Base):
     warnings: Mapped[list[str]] = mapped_column(default=list)
     script_count: Mapped[int] = mapped_column(Integer, default=0)
     data_block_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Security-relevant response headers as served (see headers.py), and any CSP set with
+    # <meta http-equiv="Content-Security-Policy">.
+    security_headers: Mapped[dict[str, list[str]]] = mapped_column(
+        default=dict, server_default=text("'{}'")
+    )
+    meta_csp: Mapped[list[str]] = mapped_column(default=list, server_default=text("'[]'"))
     fetched_at: Mapped[datetime] = mapped_column(default=utcnow)
 
     scan: Mapped[Scan] = relationship(back_populates="snapshots")
@@ -366,12 +407,57 @@ class ScriptObservation(Base):
     is_async: Mapped[bool] = mapped_column(Boolean, default=False)
     is_defer: Mapped[bool] = mapped_column(Boolean, default=False)
     nomodule: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Inline scripts: the body's SHA-384 and size (external bodies are fetched on day 3).
+    # Inline scripts: the body's SHA-384 and size.
     inline_sha384: Mapped[str | None] = mapped_column(String(96))
     inline_size_bytes: Mapped[int | None] = mapped_column(Integer)
+    # The body this page got: the inline body, or the external script as fetched this scan.
+    # NULL when an external script couldn't be fetched.
+    version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("script_versions.id", ondelete="SET NULL")
+    )
+    # External scripts with an integrity attribute: what the browser would do with it.
+    sri_status: Mapped[SriStatus | None] = mapped_column(_enum(SriStatus, "sri_status", 32))
 
     snapshot: Mapped[PageSnapshot] = relationship(back_populates="observations")
     script: Mapped[Script] = relationship()
+    version: Mapped[ScriptVersion | None] = relationship()
+
+
+class ScriptFetch(Base):
+    """One download of an external script during a scan.
+
+    A script referenced by several pages is fetched once per scan. Third-party scripts are
+    fetched only because an allowlisted page references them, and never parsed as pages.
+    """
+
+    __tablename__ = "script_fetches"
+    __table_args__ = (
+        UniqueConstraint("scan_id", "script_id", name="uq_script_fetches_scan_script"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    scan_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"))
+    script_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("scripts.id", ondelete="CASCADE"))
+    version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("script_versions.id", ondelete="SET NULL")
+    )
+    url: Mapped[str] = mapped_column(String(2048))
+    outcome: Mapped[ScriptFetchOutcome] = mapped_column(
+        _enum(ScriptFetchOutcome, "script_fetch_outcome", 32)
+    )
+    final_url: Mapped[str | None] = mapped_column(String(2048))
+    http_status: Mapped[int | None] = mapped_column(Integer)
+    content_type: Mapped[str | None] = mapped_column(String(255))
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
+    elapsed_ms: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(String(1024))
+    # Whether this scan saw this body for the first time (a new version of the script).
+    new_version: Mapped[bool] = mapped_column(Boolean, default=False)
+    fetched_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    scan: Mapped[Scan] = relationship(back_populates="script_fetches")
+    script: Mapped[Script] = relationship()
+    version: Mapped[ScriptVersion | None] = relationship()
 
 
 def sri_from_sha384_hex(hex_digest: str) -> str:
