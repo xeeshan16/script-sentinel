@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from alembic import context
+from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from script_sentinel.db import make_engine
@@ -43,10 +44,16 @@ def _run(connection: Connection) -> None:
     )
     with context.begin_transaction():
         context.run_migrations()
+    if connection.dialect.name == "sqlite":
+        # Foreign keys are off while migrating (see make_engine); make sure the schema
+        # changes left every reference intact.
+        broken = connection.execute(text("PRAGMA foreign_key_check")).fetchall()
+        if broken:
+            raise RuntimeError(f"migration left dangling foreign keys: {broken[:5]}")
 
 
 async def run_migrations_online() -> None:
-    engine = make_engine(_url())
+    engine = make_engine(_url(), sqlite_foreign_keys=False)
     try:
         async with engine.connect() as connection:
             await connection.run_sync(_run)

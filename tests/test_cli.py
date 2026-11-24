@@ -27,7 +27,7 @@ def test_version() -> None:
 def test_db_commands(tmp_path: Path) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path / 'cli.db'}"
     assert _invoke("db", "upgrade", "--url", url) == (0, "database upgraded to head\n")
-    assert _invoke("db", "current", "--url", url) == (0, "0003 (head)\n")
+    assert _invoke("db", "current", "--url", url) == (0, "0004 (head)\n")
     assert _invoke("db", "downgrade", "base", "--url", url) == (
         0,
         "database downgraded to base\n",

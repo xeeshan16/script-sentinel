@@ -107,6 +107,20 @@ def normalize_page_url(url: str) -> str:
     return urlunsplit((origin.scheme, netloc, parts.path or "/", parts.query, ""))
 
 
+def normalize_url_prefix(value: str) -> str:
+    """The canonical form of a URL prefix such as ``https://cdn.vendor.com/sdk/``.
+
+    The scheme, host and port are normalized like an origin and the path is kept as given.
+    The path always starts with ``/``, so a prefix can never match another host that
+    merely starts with the same name (``https://cdn.vendor.com.evil.test/``). A query or
+    fragment is rejected: prefixes match paths.
+    """
+    parts, origin = _split(value)
+    if parts.query or parts.fragment or value.strip().endswith(("?", "#")):
+        raise InvalidUrlError(f"{value!r} has a query or fragment; a prefix matches paths only")
+    return f"{origin}{parts.path or '/'}"
+
+
 def normalize_origins(values: list[str]) -> list[str]:
     """Parse, deduplicate and sort allowlist entries. At least one is required."""
     origins = sorted({parse_origin(v) for v in values})

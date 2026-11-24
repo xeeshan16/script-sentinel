@@ -175,6 +175,8 @@ _SUMMARY_COLUMNS = (
     ScriptVersion.size_bytes,
     ScriptVersion.first_seen_at,
     ScriptVersion.last_seen_at,
+    ScriptVersion.approved_at,
+    ScriptVersion.approved_by,
 )
 
 

@@ -15,15 +15,18 @@ network:
    recorded as a :class:`ScriptVersion`, and each ``integrity`` attribute is checked
    against the body the way a browser would.
 
-The scan itself never decides whether a script is acceptable. That is the policy engine's
-job (day 4), working from the inventory this builds.
+Policies can change how external scripts are identified: one that drops cache-busting
+query parameters makes ``app.js?v=1`` and ``app.js?v=2`` the same inventory entry. After
+recording, the status of every script the scan saw is re-evaluated (see
+:mod:`script_sentinel.authorization`); status changes go to the audit trail, and each
+observation keeps the status its script had when the scan finished.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -31,9 +34,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from script_sentinel import audit, authorization
 from script_sentinel.db.models import (
+    AuthorizationStatus,
     Page,
     PageSnapshot,
+    Policy,
     Scan,
     ScanStatus,
     ScanTrigger,
@@ -72,9 +78,9 @@ class FetchedScript:
     fetched_at: datetime
 
 
-def locator_for(page_url: str, script: ParsedScript) -> str:
+def locator_for(page_url: str, script: ParsedScript, policies: Sequence[Policy] = ()) -> str:
     if script.src is not None:
-        return script.src
+        return authorization.external_locator(script.src, policies)
     assert script.inline_index is not None
     return inline_locator(page_url, script.inline_index)
 
@@ -161,6 +167,7 @@ async def record_scan(
     script missing from it is recorded without a version (its integrity is ``unverified``).
     """
     scripts = scripts or {}
+    policies = await authorization.load_policies(session, site.id)
     existing = {
         s.locator: s for s in await session.scalars(select(Script).where(Script.site_id == site.id))
     }
@@ -199,6 +206,9 @@ async def record_scan(
     changed: set[uuid.UUID] = set()
     # External scripts: their version for this scan, recorded once per URL.
     external: dict[str, tuple[Script, ScriptVersion | None]] = {}
+    # The bodies each script served this scan; they become its current versions.
+    served: dict[uuid.UUID, set[uuid.UUID]] = {}
+    observations: list[ScriptObservation] = []
 
     def upsert_script(locator: str, parsed: ParsedScript, seen_at: datetime) -> Script:
         script = existing.get(locator)
@@ -221,6 +231,7 @@ async def record_scan(
 
     def record_version(script: Script, digest: BodyDigest, seen_at: datetime) -> ScriptVersion:
         recorded = recorder.record(session, script, digest, seen_at)
+        served.setdefault(script.id, set()).add(recorded.version.id)
         if recorded.new_version:
             new_versions.add(recorded.version.id)
         if recorded.changed:
@@ -256,7 +267,7 @@ async def record_scan(
             continue
         page_url = fetch.final_url or result.url
         for parsed in inventory.scripts:
-            locator = locator_for(page_url, parsed)
+            locator = locator_for(page_url, parsed, policies)
             script = upsert_script(locator, parsed, result.fetched_at)
             version: ScriptVersion | None = None
             sri_status: SriStatus | None = None
@@ -278,26 +289,26 @@ async def record_scan(
                         sri_status = check_integrity_digests(
                             parsed.integrity, fetched.digest.digests
                         )
-            session.add(
-                ScriptObservation(
-                    snapshot=snapshot,
-                    script=script,
-                    position=parsed.position,
-                    script_type=parsed.script_type,
-                    type_attribute=(parsed.type_attribute or "")[:128] or None,
-                    integrity=(parsed.integrity or "")[:1024] or None,
-                    crossorigin=(parsed.crossorigin or "")[:32] or None,
-                    referrerpolicy=(parsed.referrerpolicy or "")[:64] or None,
-                    nonce_digest=parsed.nonce_digest,
-                    is_async=parsed.is_async,
-                    is_defer=parsed.is_defer,
-                    nomodule=parsed.nomodule,
-                    inline_sha384=parsed.body_sha384,
-                    inline_size_bytes=parsed.body_size,
-                    version=version,
-                    sri_status=sri_status,
-                )
+            observation = ScriptObservation(
+                snapshot=snapshot,
+                script=script,
+                position=parsed.position,
+                script_type=parsed.script_type,
+                type_attribute=(parsed.type_attribute or "")[:128] or None,
+                integrity=(parsed.integrity or "")[:1024] or None,
+                crossorigin=(parsed.crossorigin or "")[:32] or None,
+                referrerpolicy=(parsed.referrerpolicy or "")[:64] or None,
+                nonce_digest=parsed.nonce_digest,
+                is_async=parsed.is_async,
+                is_defer=parsed.is_defer,
+                nomodule=parsed.nomodule,
+                inline_sha384=parsed.body_sha384,
+                inline_size_bytes=parsed.body_size,
+                version=version,
+                sri_status=sri_status,
             )
+            session.add(observation)
+            observations.append(observation)
 
     for url, (script, version) in sorted(external.items()):
         fetched = scripts.get(url)
@@ -326,10 +337,33 @@ async def record_scan(
         else:
             scan.scripts_fetch_failed += 1
 
+    seen_scripts = sorted((existing[locator] for locator in seen), key=lambda s: s.locator)
+    for script in seen_scripts:
+        if script.id in served:
+            # A script whose body couldn't be fetched keeps its previous current versions.
+            script.current_version_ids = sorted(str(v) for v in served[script.id])
+    await session.flush()
+    await authorization.reevaluate(
+        session,
+        site,
+        seen_scripts,
+        audit.AuditLog(session, site.id, clock=clock),
+        actor="scan",
+        policies=policies,
+        detail={"cause": "scan", "scan_id": str(scan.id)},
+        clock=clock,
+    )
+    for observation in observations:
+        observation.authorization_status = observation.script.status
+
     scan.scripts_seen = len(seen)
     scan.scripts_new = len(new)
     scan.versions_new = len(new_versions)
     scan.scripts_changed = len(changed)
+    statuses = [s.status for s in seen_scripts]
+    scan.scripts_approved = statuses.count(AuthorizationStatus.APPROVED)
+    scan.scripts_pending = statuses.count(AuthorizationStatus.PENDING)
+    scan.scripts_rejected = statuses.count(AuthorizationStatus.REJECTED)
     scan.finished_at = clock()
     await session.flush()
     return scan

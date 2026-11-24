@@ -13,10 +13,16 @@ from sqlalchemy.ext.asyncio import (
 )
 
 
-def make_engine(database_url: str, **kwargs: Any) -> AsyncEngine:
-    """An async engine. SQLite connections get foreign keys switched on."""
+def make_engine(
+    database_url: str, *, sqlite_foreign_keys: bool = True, **kwargs: Any
+) -> AsyncEngine:
+    """An async engine. SQLite connections get foreign keys switched on.
+
+    Migrations pass ``sqlite_foreign_keys=False``: rebuilding a table on SQLite drops the
+    old one, and with foreign keys on that would cascade into every referencing table.
+    """
     engine = create_async_engine(database_url, **kwargs)
-    if engine.dialect.name == "sqlite":
+    if engine.dialect.name == "sqlite" and sqlite_foreign_keys:
 
         @event.listens_for(engine.sync_engine, "connect")
         def _sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:

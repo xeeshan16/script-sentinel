@@ -8,6 +8,12 @@
   block, with its authorization status and the justification for it.
 * A **script version** is one distinct body a script has served, identified by its SHA-384.
   A script that changes on the vendor's CDN gets a new version.
+* A **policy** authorizes scripts in bulk: everything from an origin or under a URL prefix,
+  or any body with a given hash. Origin and prefix policies either pin the first body seen
+  or accept that the vendor ships new ones ("expected to change"), and can drop
+  cache-busting query parameters from the locator.
+* An **authorization event** is one entry of a site's append-only, hash-chained audit trail:
+  a decision, a policy change, or a script's status changing after a scan.
 * A **finding** is something a person should look at: an unapproved script, a changed
   body, a suspicious pattern.
 * A **script fetch** is one download of an external script during a scan: what came back
@@ -87,6 +93,29 @@ class AuthorizationStatus(enum.StrEnum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
+
+
+class Decision(enum.StrEnum):
+    """What a person decided about a script. ``status`` is what applies right now."""
+
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class ApprovalScope(enum.StrEnum):
+    PINNED = "pinned"  # the approved bodies only; a new body needs another look
+    ANY_VERSION = "any_version"  # the vendor is expected to ship new bodies
+
+
+class PolicyKind(enum.StrEnum):
+    ORIGIN = "origin"  # external scripts from one origin
+    PREFIX = "prefix"  # external scripts whose URL starts with a prefix
+    HASH = "hash"  # any body (external or inline) with this SHA-384
+
+
+class ChangePolicy(enum.StrEnum):
+    PINNED = "pinned"  # approve the first body seen, flag any other
+    EXPECTED_TO_CHANGE = "expected_to_change"
 
 
 class Severity(enum.StrEnum):
@@ -248,6 +277,23 @@ class Script(Base):
     decided_at: Mapped[datetime | None]
     first_seen_at: Mapped[datetime] = mapped_column(default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(default=utcnow)
+    # A person's decision (with ``justification``, ``decided_by`` and ``decided_at``).
+    # ``status`` is derived from it, the policies and the bodies currently served.
+    decision: Mapped[Decision | None] = mapped_column(_enum(Decision, "decision"))
+    approval_scope: Mapped[ApprovalScope | None] = mapped_column(
+        _enum(ApprovalScope, "approval_scope")
+    )
+    # Why ``status`` is what it is, and the policy that authorized the script, if any.
+    status_reason: Mapped[str | None] = mapped_column(String(512))
+    status_changed_at: Mapped[datetime | None]
+    policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("policies.id", ondelete="SET NULL")
+    )
+    # The bodies the script served the last time it was fetched successfully (version ids
+    # as strings). A failed fetch leaves them alone, so a network error never flips status.
+    current_version_ids: Mapped[list[str]] = mapped_column(
+        default=list, server_default=text("'[]'")
+    )
 
     versions: Mapped[list[ScriptVersion]] = relationship(
         back_populates="script", cascade="all, delete-orphan", passive_deletes=True
@@ -272,6 +318,9 @@ class ScriptVersion(Base):
     content: Mapped[str | None] = mapped_column(Text)
     first_seen_at: Mapped[datetime] = mapped_column(default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(default=utcnow)
+    # Set when a person (or a pinning policy) approved this exact body.
+    approved_at: Mapped[datetime | None]
+    approved_by: Mapped[str | None] = mapped_column(String(128))
 
     script: Mapped[Script] = relationship(back_populates="versions")
 
@@ -327,6 +376,10 @@ class Scan(Base):
     # a different body (a script that changed).
     versions_new: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     scripts_changed: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The authorization status of the scripts this scan saw, right after it.
+    scripts_approved: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    scripts_pending: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    scripts_rejected: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     snapshots: Mapped[list[PageSnapshot]] = relationship(
         back_populates="scan",
@@ -417,6 +470,10 @@ class ScriptObservation(Base):
     )
     # External scripts with an integrity attribute: what the browser would do with it.
     sri_status: Mapped[SriStatus | None] = mapped_column(_enum(SriStatus, "sri_status", 32))
+    # The script's authorization status when this scan finished (evidence for 6.4.3).
+    authorization_status: Mapped[AuthorizationStatus | None] = mapped_column(
+        _enum(AuthorizationStatus, "observation_authorization_status")
+    )
 
     snapshot: Mapped[PageSnapshot] = relationship(back_populates="observations")
     script: Mapped[Script] = relationship()
@@ -431,9 +488,9 @@ class ScriptFetch(Base):
     """
 
     __tablename__ = "script_fetches"
-    __table_args__ = (
-        UniqueConstraint("scan_id", "script_id", name="uq_script_fetches_scan_script"),
-    )
+    # One row per URL: a policy that drops cache-busting query parameters can map several
+    # URLs to one script.
+    __table_args__ = (UniqueConstraint("scan_id", "url", name="uq_script_fetches_scan_url"),)
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     scan_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"))
@@ -458,6 +515,61 @@ class ScriptFetch(Base):
     scan: Mapped[Scan] = relationship(back_populates="script_fetches")
     script: Mapped[Script] = relationship()
     version: Mapped[ScriptVersion | None] = relationship()
+
+
+class Policy(Base):
+    """A rule that authorizes scripts of a site without a decision per script."""
+
+    __tablename__ = "policies"
+    __table_args__ = (
+        UniqueConstraint("site_id", "kind", "match", name="uq_policies_site_kind_match"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    site_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"))
+    kind: Mapped[PolicyKind] = mapped_column(_enum(PolicyKind, "policy_kind"))
+    # A normalized origin, a URL prefix (always with a path), or a hex SHA-384.
+    match: Mapped[str] = mapped_column(String(2048))
+    change: Mapped[ChangePolicy] = mapped_column(_enum(ChangePolicy, "change_policy", 32))
+    # Query parameters dropped from matching script URLs before they become locators, so
+    # ``app.js?v=123`` and ``app.js?v=124`` are one script. ``*`` drops the whole query.
+    ignore_query: Mapped[list[str]] = mapped_column(default=list)
+    justification: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class AuthorizationEvent(Base):
+    """One entry of a site's audit trail. Rows are only ever inserted.
+
+    Each event carries the SHA-256 of the previous one (``prev_hash``) and of itself, so
+    an edited, removed or reordered row breaks the chain (see audit.verify_chain).
+    """
+
+    __tablename__ = "authorization_events"
+    __table_args__ = (
+        UniqueConstraint("site_id", "seq", name="uq_authorization_events_site_seq"),
+        Index("ix_authorization_events_script_id", "script_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    site_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"))
+    seq: Mapped[int] = mapped_column(Integer)
+    # Plain ids, not foreign keys: the hash covers them, so they must never change, and
+    # an event outlives the script or policy it mentions (``locator`` and ``detail`` keep
+    # it readable).
+    script_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    policy_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    locator: Mapped[str | None] = mapped_column(String(2048))
+    action: Mapped[str] = mapped_column(String(32))
+    actor: Mapped[str] = mapped_column(String(128))
+    from_status: Mapped[str | None] = mapped_column(String(16))
+    to_status: Mapped[str | None] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(Text)
+    detail: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    prev_hash: Mapped[str] = mapped_column(String(64))
+    hash: Mapped[str] = mapped_column(String(64))
 
 
 def sri_from_sha384_hex(hex_digest: str) -> str:
