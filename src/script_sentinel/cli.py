@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import getpass
 import json
 import uuid
 from collections.abc import Awaitable, Callable
@@ -12,11 +13,17 @@ from typing import Annotated, Any
 import typer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from script_sentinel import __version__, scanner, sites, versions
+from script_sentinel import __version__, audit, authorization, scanner, sites, versions
 from script_sentinel.config import Settings
 from script_sentinel.db import make_engine, make_sessionmaker
 from script_sentinel.db.models import (
+    ApprovalScope,
+    AuthorizationEvent,
+    AuthorizationStatus,
+    ChangePolicy,
     PageSnapshot,
+    Policy,
+    PolicyKind,
     Scan,
     ScanStatus,
     ScanTrigger,
@@ -44,17 +51,46 @@ pages_app = typer.Typer(help="Register the pages of a site that get scanned.", n
 app.add_typer(pages_app, name="pages")
 scan_app = typer.Typer(help="Scan a site's pages and inspect past scans.", no_args_is_help=True)
 app.add_typer(scan_app, name="scan")
-scripts_app = typer.Typer(help="Inspect a site's script inventory.", no_args_is_help=True)
+scripts_app = typer.Typer(
+    help="Inspect a site's script inventory and approve or reject scripts.", no_args_is_help=True
+)
 app.add_typer(scripts_app, name="scripts")
+policies_app = typer.Typer(
+    help="Authorize scripts in bulk: by origin, URL prefix or hash.", no_args_is_help=True
+)
+app.add_typer(policies_app, name="policies")
+audit_app = typer.Typer(help="Read and verify the authorization audit trail.", no_args_is_help=True)
+app.add_typer(audit_app, name="audit")
 
-# `sentinel scan run` exits with this when any page could not be inventoried.
+# `sentinel scan run` exits with this when any page could not be inventoried...
 EXIT_SCAN_INCOMPLETE = 3
+# ...and with this, under --fail-on-unauthorized, when a payment page runs a script that
+# isn't approved (it wins over EXIT_SCAN_INCOMPLETE).
+EXIT_UNAUTHORIZED = 4
 
 DatabaseURL = Annotated[
     str | None,
     typer.Option("--url", help="Database URL. Defaults to SENTINEL_DATABASE_URL."),
 ]
 JsonOutput = Annotated[bool, typer.Option("--json", help="Print JSON instead of text.")]
+Actor = Annotated[
+    str | None,
+    typer.Option(
+        "--actor",
+        envvar="SENTINEL_ACTOR",
+        help="Who is making the change, for the audit trail. Defaults to SENTINEL_ACTOR, "
+        "then the login name.",
+    ),
+]
+
+
+def _actor(actor: str | None) -> str:
+    if actor:
+        return actor
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):  # pragma: no cover - no login name in some containers
+        return "unknown"
 
 
 def _url(url: str | None) -> str:
@@ -344,6 +380,11 @@ def _scan_json(scan: Scan, site_name: str) -> dict[str, Any]:
             "versions_new": scan.versions_new,
             "changed": scan.scripts_changed,
         },
+        "authorization": {
+            "approved": scan.scripts_approved,
+            "pending": scan.scripts_pending,
+            "rejected": scan.scripts_rejected,
+        },
         "snapshots": [_snapshot_json(snap) for snap in scan.snapshots],
         "script_fetches": [
             {
@@ -387,6 +428,9 @@ def _snapshot_json(snap: PageSnapshot) -> dict[str, Any]:
                 "sha384": obs.version.sha384 if obs.version else None,
                 "sri": obs.version.sri if obs.version else None,
                 "sri_status": obs.sri_status.value if obs.sri_status else None,
+                "authorization_status": (
+                    obs.authorization_status.value if obs.authorization_status else None
+                ),
             }
             for obs in snap.observations
         ],
@@ -425,6 +469,8 @@ def _observation_line(
     else:
         marker = " "
     extras = [obs.script_type.value]
+    if obs.authorization_status is not None:
+        extras.append(obs.authorization_status.value)
     if obs.sri_status is not None:
         extras.append(_SRI_LABEL[obs.sri_status])
     elif obs.integrity:
@@ -475,8 +521,10 @@ def _print_scan(scan: Scan, site_name: str, changes: _Changes) -> None:
                 typer.echo(f"      ! {warning}")
         else:
             typer.echo(f"  {label:<8} {snap.url}{flag}  {snap.error}")
+    typer.echo(f"inventory: {scan.scripts_seen} scripts seen, {scan.scripts_new} new")
     typer.echo(
-        f"inventory: {scan.scripts_seen} scripts seen, {scan.scripts_new} new (pending approval)"
+        f"authorization: {scan.scripts_approved} approved, {scan.scripts_pending} pending, "
+        f"{scan.scripts_rejected} rejected"
     )
     typer.echo(
         f"bodies: {scan.scripts_fetched} external fetched, {scan.scripts_fetch_failed} failed; "
@@ -508,17 +556,43 @@ def _print_scan(scan: Scan, site_name: str, changes: _Changes) -> None:
             fg=typer.colors.YELLOW,
             err=True,
         )
+    unauthorized = _unauthorized_on_payment_pages(scan)
+    if unauthorized:
+        typer.secho(
+            f"warning: payment pages run {len(unauthorized)} scripts that are not approved "
+            f"(PCI DSS 6.4.3); review them with: sentinel scripts list {site_name}",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+
+def _unauthorized_on_payment_pages(scan: Scan) -> set[str]:
+    return {
+        obs.script.locator
+        for snap in scan.snapshots
+        if snap.payment_page
+        for obs in snap.observations
+        if obs.authorization_status not in (None, AuthorizationStatus.APPROVED)
+    }
 
 
 @scan_app.command("run")
 def scan_run(
     site: Annotated[str, typer.Argument(help="Site name.")],
+    fail_on_unauthorized: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-unauthorized",
+            help="Exit 4 when a payment page runs a script that isn't approved.",
+        ),
+    ] = False,
     as_json: JsonOutput = False,
     url: DatabaseURL = None,
 ) -> None:
     """Fetch every page of SITE now, record its scripts and print what was found.
 
-    Exits 3 when any page could not be inventoried.
+    Exits 3 when any page could not be inventoried, and 4 with --fail-on-unauthorized when
+    a payment page runs a script that isn't approved.
     """
     settings = Settings()
 
@@ -551,6 +625,8 @@ def scan_run(
         typer.echo(json.dumps(_scan_json(scan, name), indent=2))
     else:
         _print_scan(scan, name, changes)
+    if fail_on_unauthorized and _unauthorized_on_payment_pages(scan):
+        raise typer.Exit(code=EXIT_UNAUTHORIZED)
     if scan.status is not ScanStatus.COMPLETED:
         raise typer.Exit(code=EXIT_SCAN_INCOMPLETE)
 
@@ -632,6 +708,8 @@ def _version_json(version: ScriptVersion) -> dict[str, Any]:
         "size_bytes": version.size_bytes,
         "first_seen_at": version.first_seen_at.isoformat(),
         "last_seen_at": version.last_seen_at.isoformat(),
+        "approved_at": version.approved_at.isoformat() if version.approved_at else None,
+        "approved_by": version.approved_by,
     }
 
 
@@ -641,6 +719,12 @@ def _script_json(script: Script, history: list[ScriptVersion]) -> dict[str, Any]
         "kind": script.kind.value,
         "locator": script.locator,
         "status": script.status.value,
+        "status_reason": script.status_reason,
+        "policy_id": str(script.policy_id) if script.policy_id else None,
+        "decision": script.decision.value if script.decision else None,
+        "approval_scope": script.approval_scope.value if script.approval_scope else None,
+        "justification": script.justification,
+        "decided_by": script.decided_by,
         "first_seen_at": script.first_seen_at.isoformat(),
         "last_seen_at": script.last_seen_at.isoformat(),
         "version_count": len(history),
@@ -695,6 +779,15 @@ def scripts_show(
         return
     typer.echo(f"{script.locator}")
     typer.echo(f"  kind: {script.kind.value}   status: {script.status.value}")
+    if script.status_reason:
+        typer.echo(f"  why: {script.status_reason}")
+    if script.decision is not None and script.decided_at is not None:
+        scope = f", {script.approval_scope.value}" if script.approval_scope else ""
+        typer.echo(
+            f"  decision: {script.decision.value}{scope} by {script.decided_by} "
+            f"at {script.decided_at:%Y-%m-%d %H:%M:%S}Z"
+        )
+        typer.echo(f"  justification: {script.justification}")
     typer.echo(
         f"  seen: {script.first_seen_at:%Y-%m-%d %H:%M:%S}Z .. "
         f"{script.last_seen_at:%Y-%m-%d %H:%M:%S}Z"
@@ -704,9 +797,10 @@ def scripts_show(
         return
     typer.echo(f"  versions ({len(history)}, most recently seen first):")
     for version in history:
+        approved = f"  approved by {version.approved_by}" if version.approved_by else ""
         typer.echo(
             f"    {version.last_seen_at:%Y-%m-%d %H:%M:%S}Z  {version.size_bytes:>8} bytes  "
-            f"{version.sri}"
+            f"{version.sri}{approved}"
         )
     current = history[0]
     if script.kind is ScriptKind.EXTERNAL:
@@ -717,3 +811,345 @@ def scripts_show(
         )
     else:
         typer.echo(f"  CSP hash source for the current body: '{current.sri}'")
+
+
+Locator = Annotated[str, typer.Argument(help="The script's src URL, or PAGE#inline-N.")]
+
+
+def _decision(
+    site: str,
+    locator: str,
+    url: str | None,
+    decide: Callable[[AsyncSession, uuid.UUID], Awaitable[Script]],
+) -> None:
+    async def work(session: AsyncSession) -> Script:
+        script = await versions.find_script(session, site, locator)
+        return await decide(session, script.id)
+
+    script = _run(url, work)
+    typer.echo(f"{script.status.value}: {script.locator}")
+    typer.echo(f"  why: {script.status_reason}")
+
+
+@scripts_app.command("approve")
+def scripts_approve(
+    site: str,
+    locator: Locator,
+    justification: Annotated[
+        str,
+        typer.Option("--justification", "-j", help="Why the script is necessary (PCI DSS 6.4.3)."),
+    ],
+    any_version: Annotated[
+        bool,
+        typer.Option(
+            "--any-version",
+            help="Approve whatever the vendor serves, not just the current body.",
+        ),
+    ] = False,
+    actor: Actor = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Approve a script. By default the approval is pinned to the bodies it serves now."""
+    scope = ApprovalScope.ANY_VERSION if any_version else ApprovalScope.PINNED
+    _decision(
+        site,
+        locator,
+        url,
+        lambda session, script_id: authorization.approve_script(
+            session,
+            site,
+            script_id,
+            actor=_actor(actor),
+            justification=justification,
+            scope=scope,
+        ),
+    )
+
+
+@scripts_app.command("reject")
+def scripts_reject(
+    site: str,
+    locator: Locator,
+    reason: Annotated[str, typer.Option("--reason", "-r", help="Why it must not run.")],
+    actor: Actor = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Reject a script. A rejection overrides every policy."""
+    _decision(
+        site,
+        locator,
+        url,
+        lambda session, script_id: authorization.reject_script(
+            session, site, script_id, actor=_actor(actor), reason=reason
+        ),
+    )
+
+
+@scripts_app.command("reset")
+def scripts_reset(
+    site: str,
+    locator: Locator,
+    reason: Annotated[str, typer.Option("--reason", "-r", help="Why the decision goes.")],
+    actor: Actor = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Withdraw the decision about a script, so policies alone decide its status."""
+    _decision(
+        site,
+        locator,
+        url,
+        lambda session, script_id: authorization.reset_script(
+            session, site, script_id, actor=_actor(actor), reason=reason
+        ),
+    )
+
+
+def _policy_json(policy: Policy) -> dict[str, Any]:
+    return {
+        "id": str(policy.id),
+        "kind": policy.kind.value,
+        "match": policy.match,
+        "change": policy.change.value,
+        "ignore_query": list(policy.ignore_query),
+        "justification": policy.justification,
+        "created_by": policy.created_by,
+        "created_at": policy.created_at.isoformat(),
+    }
+
+
+def _changes_json(changes: list[authorization.Change]) -> list[dict[str, Any]]:
+    return [
+        {
+            "locator": c.script.locator,
+            "from_status": c.from_status.value if c.from_status else None,
+            "to_status": c.to_status.value,
+        }
+        for c in changes
+    ]
+
+
+def _print_changes(changes: list[authorization.Change]) -> None:
+    for c in changes:
+        before = c.from_status.value if c.from_status else "new"
+        typer.echo(
+            f"  {before} -> {c.to_status.value}: {c.script.locator}  ({c.script.status_reason})"
+        )
+    if not changes:
+        typer.echo("  no script changed status")
+
+
+@policies_app.command("add")
+def policies_add(
+    site: str,
+    justification: Annotated[
+        str, typer.Option("--justification", "-j", help="Why these scripts are acceptable.")
+    ],
+    origin: Annotated[
+        str | None, typer.Option("--origin", help="Every external script from this origin.")
+    ] = None,
+    prefix: Annotated[
+        str | None,
+        typer.Option("--prefix", help="Every external script under this URL prefix."),
+    ] = None,
+    sha384: Annotated[
+        str | None,
+        typer.Option("--hash", help="Any body with this SHA-384 (hex or sha384-<base64>)."),
+    ] = None,
+    expected_to_change: Annotated[
+        bool,
+        typer.Option(
+            "--expected-to-change",
+            help="Accept every body. Without it the first body seen is pinned.",
+        ),
+    ] = False,
+    ignore_query: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--ignore-query",
+            help="Query parameter to drop from matching URLs, e.g. a cache buster "
+            "(repeatable; '*' drops the whole query).",
+        ),
+    ] = None,
+    actor: Actor = None,
+    as_json: JsonOutput = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Add a policy and re-evaluate the site's scripts under it."""
+    given = [
+        (k, v)
+        for k, v in (
+            (PolicyKind.ORIGIN, origin),
+            (PolicyKind.PREFIX, prefix),
+            (PolicyKind.HASH, sha384),
+        )
+        if v is not None
+    ]
+    if len(given) != 1:
+        typer.secho(
+            "error: give exactly one of --origin, --prefix or --hash", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=2)
+    kind, match = given[0]
+    change = ChangePolicy.EXPECTED_TO_CHANGE if expected_to_change else ChangePolicy.PINNED
+
+    async def work(session: AsyncSession) -> tuple[Policy, list[authorization.Change]]:
+        return await authorization.create_policy(
+            session,
+            site,
+            kind=kind,
+            match=match,
+            change=change,
+            ignore_query=ignore_query or [],
+            justification=justification,
+            actor=_actor(actor),
+        )
+
+    policy, changes = _run(url, work)
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {"policy": _policy_json(policy), "scripts_changed": _changes_json(changes)},
+                indent=2,
+            )
+        )
+        return
+    typer.echo(f"added policy {policy.id}: {authorization.describe_policy(policy)}")
+    _print_changes(changes)
+
+
+@policies_app.command("list")
+def policies_list(site: str, as_json: JsonOutput = False, url: DatabaseURL = None) -> None:
+    """List a site's policies, oldest first."""
+
+    async def work(session: AsyncSession) -> list[Policy]:
+        return await authorization.list_policies(session, site)
+
+    policies = _run(url, work)
+    if as_json:
+        typer.echo(json.dumps([_policy_json(p) for p in policies], indent=2))
+        return
+    if not policies:
+        typer.echo(f"no policies for {site}; add one with: sentinel policies add {site} --help")
+        return
+    for p in policies:
+        query = f"  ignore query: {', '.join(p.ignore_query)}" if p.ignore_query else ""
+        typer.echo(f"{p.id}  {p.kind.value:<6} {p.change.value:<18} {p.match}{query}")
+        typer.echo(f"    {p.justification} ({p.created_by}, {p.created_at:%Y-%m-%d})")
+
+
+@policies_app.command("remove")
+def policies_remove(
+    site: str,
+    policy_id: Annotated[str, typer.Argument(metavar="POLICY_ID")],
+    reason: Annotated[str, typer.Option("--reason", "-r", help="Why the policy goes.")],
+    actor: Actor = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Remove a policy and re-evaluate the scripts it covered."""
+    try:
+        parsed = uuid.UUID(policy_id)
+    except ValueError:
+        typer.secho(f"error: {policy_id!r} is not a policy id", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from None
+
+    async def work(session: AsyncSession) -> list[authorization.Change]:
+        return await authorization.remove_policy(
+            session, site, parsed, actor=_actor(actor), reason=reason
+        )
+
+    changes = _run(url, work)
+    typer.echo(f"removed policy {parsed}")
+    _print_changes(changes)
+
+
+def _event_json(event: AuthorizationEvent) -> dict[str, Any]:
+    return {
+        "seq": event.seq,
+        "action": event.action,
+        "actor": event.actor,
+        "locator": event.locator,
+        "script_id": str(event.script_id) if event.script_id else None,
+        "policy_id": str(event.policy_id) if event.policy_id else None,
+        "from_status": event.from_status,
+        "to_status": event.to_status,
+        "reason": event.reason,
+        "detail": event.detail,
+        "created_at": event.created_at.isoformat(),
+        "prev_hash": event.prev_hash,
+        "hash": event.hash,
+    }
+
+
+@audit_app.command("list")
+def audit_list(
+    site: str,
+    locator: Annotated[
+        str | None, typer.Option("--script", help="Only events about this script.")
+    ] = None,
+    limit: Annotated[int, typer.Option(min=1, max=1000, help="How many events.")] = 50,
+    as_json: JsonOutput = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Show the authorization audit trail of a site, newest first."""
+
+    async def work(session: AsyncSession) -> list[AuthorizationEvent]:
+        found = await sites.get_site(session, site)
+        script_id = (await versions.find_script(session, site, locator)).id if locator else None
+        return await audit.list_events(session, found.id, script_id=script_id, limit=limit)
+
+    events = _run(url, work)
+    if as_json:
+        typer.echo(json.dumps([_event_json(e) for e in events], indent=2))
+        return
+    if not events:
+        typer.echo(f"no audit events for {site} yet")
+        return
+    for e in events:
+        move = f"{e.from_status or 'new'} -> {e.to_status}" if e.to_status else ""
+        subject = e.locator or (
+            f"{e.detail.get('kind')} {e.detail.get('match')}" if e.policy_id else ""
+        )
+        typer.echo(
+            f"#{e.seq:<4} {e.created_at:%Y-%m-%d %H:%M:%S}Z  {e.action:<21} {e.actor:<16} "
+            f"{move:<21} {subject}"
+        )
+        if e.reason:
+            typer.echo(f"      {e.reason}")
+
+
+@audit_app.command("verify")
+def audit_verify(site: str, as_json: JsonOutput = False, url: DatabaseURL = None) -> None:
+    """Recompute the audit trail's hash chain. Exits 1 when it is broken."""
+
+    async def work(session: AsyncSession) -> audit.ChainReport:
+        found = await sites.get_site(session, site)
+        return await audit.verify_chain(session, found.id)
+
+    report = _run(url, work)
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "site": site,
+                    "ok": report.ok,
+                    "events": report.events,
+                    "head_hash": report.head_hash,
+                    "first_bad_seq": report.first_bad_seq,
+                    "problem": report.problem,
+                },
+                indent=2,
+            )
+        )
+    elif report.ok:
+        typer.echo(
+            f"audit trail of {site} is intact: {report.events} events, head {report.head_hash}"
+        )
+    else:
+        typer.secho(
+            f"audit trail of {site} is BROKEN at event {report.first_bad_seq}: {report.problem} "
+            f"({report.events} events verified before it)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+    if not report.ok:
+        raise typer.Exit(code=1)

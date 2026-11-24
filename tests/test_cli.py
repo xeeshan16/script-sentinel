@@ -163,22 +163,24 @@ def test_scan_run_list_show_and_scripts(sqlite_url: str, fixture_site: FixtureSi
     assert lines[1:] == [
         f"  ok       {origin}/  200  1 scripts",
         "      headers: CSP report-only, nosniff",
-        f"        {origin}/app.js  (classic)  {sri_v1[:22]}…",
+        f"        {origin}/app.js  (classic, pending)  {sri_v1[:22]}…",
         f"  ok       {origin}/checkout [payment]  200  2 scripts (1 new)",
         "      headers: no security headers",
-        f"        {origin}/app.js  (classic, INTEGRITY MISMATCH)  {sri_v1[:22]}…",
-        f"      + {origin}/checkout#inline-1  (classic, nonce)  {inline_sri[:22]}…",
+        f"        {origin}/app.js  (classic, pending, INTEGRITY MISMATCH)  {sri_v1[:22]}…",
+        f"      + {origin}/checkout#inline-1  (classic, pending, nonce)  {inline_sri[:22]}…",
         "      ! skipped <script> with a javascript: src that can't be fetched: javascript:x()",
-        "inventory: 2 scripts seen, 1 new (pending approval)",
+        "inventory: 2 scripts seen, 1 new",
+        "authorization: 0 approved, 2 pending, 0 rejected",
         "bodies: 1 external fetched, 0 failed; 1 new versions, 0 scripts changed",
     ]
     assert "1 script tags fail their integrity check" in result.stderr
+    assert "payment pages run 2 scripts that are not approved" in result.stderr
 
     # The vendor ships a new body: a new version of the same script, marked "~".
     fixture_site.set("/app.js", b"boot(2);\n", content_type="text/javascript")
     code, out = _invoke("scan", "run", "shop", *url)
     assert code == 0
-    assert f"      ~ {origin}/app.js  (classic)  " in out
+    assert f"      ~ {origin}/app.js  (classic, pending)  " in out
     assert "bodies: 1 external fetched, 0 failed; 1 new versions, 1 scripts changed" in out
 
     code, out = _invoke("scan", "list", "shop", *url)
@@ -239,10 +241,11 @@ def test_scan_run_list_show_and_scripts(sqlite_url: str, fixture_site: FixtureSi
     lines = out.splitlines()
     assert lines[0] == f"{origin}/app.js"
     assert lines[1] == "  kind: external   status: pending"
-    assert lines[3] == "  versions (2, most recently seen first):"
-    assert lines[4].endswith(f"       9 bytes  {sri_v2}")
-    assert lines[5].endswith(f"       8 bytes  {sri_v1}")
-    assert lines[6:] == [
+    assert lines[2] == "  why: no decision or policy covers this script yet"
+    assert lines[4] == "  versions (2, most recently seen first):"
+    assert lines[5].endswith(f"       9 bytes  {sri_v2}")
+    assert lines[6].endswith(f"       8 bytes  {sri_v1}")
+    assert lines[7:] == [
         "  pin the current body with:",
         f'    <script src="{origin}/app.js" integrity="{sri_v2}" crossorigin="anonymous"></script>',
     ]
@@ -277,16 +280,19 @@ def test_scan_run_reports_scripts_it_could_not_fetch(
     result = runner.invoke(app, ["scan", "run", "shop", *url])
     assert result.exit_code == 0  # the page itself was inventoried
     assert (
-        f"      + {fixture_site.url('/gone.js')}  (classic, integrity unverified, "
+        f"      + {fixture_site.url('/gone.js')}  (classic, pending, integrity unverified, "
         "not fetched: HTTP 404)"
     ) in result.stdout
     assert "bodies: 0 external fetched, 1 failed; 1 new versions" in result.stdout
     assert "1 external scripts could not be fetched" in result.stderr
     # integrity on an inline script is ignored by browsers; it's only shown as present.
-    assert f"      + {fixture_site.url('/#inline-1')}  (classic, integrity)  " in result.stdout
+    assert (
+        f"      + {fixture_site.url('/#inline-1')}  (classic, pending, integrity)  "
+        in result.stdout
+    )
     # Next time the script is already known, and the failure is marked with "!".
     out = _invoke("scan", "run", "shop", *url)[1]
-    assert f"      ! {fixture_site.url('/gone.js')}  (classic, integrity unverified" in out
+    assert f"      ! {fixture_site.url('/gone.js')}  (classic, pending, integrity unverified" in out
     out = _invoke("scripts", "show", "shop", fixture_site.url("/gone.js"), *url)[1]
     assert out.splitlines()[-1] == "  no body recorded yet (the script could not be fetched)"
     assert "(no body yet)" in _invoke("scripts", "list", "shop", *url)[1]

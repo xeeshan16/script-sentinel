@@ -118,6 +118,13 @@ def test_openapi_lists_the_routes(client: TestClient) -> None:
         "/v1/sites/{name}/scripts/{script_id}",
         "/v1/sites/{name}/scripts/{script_id}/versions/{version_id}/content",
         "/v1/scans/{scan_id}",
+        "/v1/sites/{name}/scripts/{script_id}/approve",
+        "/v1/sites/{name}/scripts/{script_id}/reject",
+        "/v1/sites/{name}/scripts/{script_id}/reset",
+        "/v1/sites/{name}/policies",
+        "/v1/sites/{name}/policies/{policy_id}",
+        "/v1/sites/{name}/audit",
+        "/v1/sites/{name}/audit/verify",
         "/healthz",
     } <= set(paths)
 

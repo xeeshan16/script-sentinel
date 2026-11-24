@@ -77,20 +77,40 @@ def test_quick_start_against_the_fixture_site(
     code, out = run("scan", "run", "shop")
     assert code == 0
     assert "(2 pages: 1 ok, 1 skipped)" in out.splitlines()[0]
-    assert "inventory: 3 scripts seen, 3 new (pending approval)" in out
+    assert "inventory: 3 scripts seen, 3 new" in out
     assert "bodies: 2 external fetched, 0 failed; 3 new versions, 0 scripts changed" in out
 
     assert run("sites", "update", "shop", "--ignore-robots")[0] == 0
     code, out = run("scan", "run", "shop")
     assert code == 0
     assert "(2 pages: 2 ok)" in out.splitlines()[0]
-    assert "inventory: 7 scripts seen, 4 new (pending approval)" in out
+    assert "inventory: 7 scripts seen, 4 new" in out
     assert "bodies: 4 external fetched, 0 failed; 4 new versions, 0 scripts changed" in out
     assert "      headers: CSP report-only, nosniff, Referrer-Policy" in out
-    assert f"{demo.cdn_origin}/payments/v3/elements.js  (classic, integrity ok)" in out
+    assert f"{demo.cdn_origin}/payments/v3/elements.js  (classic, pending, integrity ok)" in out
 
     code, out = run("scripts", "list", "shop")
     assert len(out.splitlines()) == 7
     code, out = run("scripts", "show", "shop", f"{demo.cdn_origin}/analytics/v2/tag.js")
     assert code == 0
     assert "pin the current body with:" in out
+
+    # The README's authorization walk-through: two policies and four approvals cover the
+    # inventory, and the payment-page gate passes.
+    assert run("scan", "run", "shop", "--fail-on-unauthorized")[0] == 4
+    cdn = demo.cdn_origin
+    steps = [
+        ("policies", "add", "shop", "--origin", site, "--expected-to-change", "-j", "1st party"),
+        ("scripts", "approve", "shop", f"{cdn}/payments/v3/elements.js", "-j", "PSP fields"),
+        ("policies", "add", "shop", "--prefix", f"{cdn}/analytics/", "-j", "Review changes"),
+        ("scripts", "approve", "shop", f"{site}/checkout.html#inline-1", "-j", "Config"),
+        ("scripts", "approve", "shop", f"{site}/checkout.html#inline-2", "-j", "Import map"),
+        ("scripts", "approve", "shop", f"{site}/index.html#inline-1", "-j", "dataLayer"),
+    ]
+    for step in steps:
+        assert run(*step, "--actor", "tester")[0] == 0, step
+    code, out = run("scan", "run", "shop", "--fail-on-unauthorized")
+    assert code == 0
+    assert "authorization: 7 approved, 0 pending, 0 rejected" in out
+    code, out = run("audit", "verify", "shop")
+    assert out.startswith("audit trail of shop is intact: 16 events")

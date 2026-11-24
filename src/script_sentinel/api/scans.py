@@ -71,6 +71,7 @@ def _detail(scan: Scan, site_name: str) -> ScanDetail:
                         sha384=obs.version.sha384 if obs.version else None,
                         sri=obs.version.sri if obs.version else None,
                         sri_status=obs.sri_status,
+                        authorization_status=obs.authorization_status,
                     )
                     for obs in snap.observations
                 ],
@@ -99,13 +100,20 @@ def _detail(scan: Scan, site_name: str) -> ScanDetail:
     )
 
 
-def _script_out(script: Script, script_versions: list[ScriptVersion]) -> dict[str, object]:
+def script_out(script: Script, script_versions: list[ScriptVersion]) -> dict[str, object]:
     return {
         "id": script.id,
         "kind": script.kind,
         "locator": script.locator,
         "status": script.status,
+        "status_reason": script.status_reason,
+        "status_changed_at": script.status_changed_at,
+        "policy_id": script.policy_id,
+        "decision": script.decision,
+        "approval_scope": script.approval_scope,
         "justification": script.justification,
+        "decided_by": script.decided_by,
+        "decided_at": script.decided_at,
         "first_seen_at": script.first_seen_at,
         "last_seen_at": script.last_seen_at,
         "version_count": len(script_versions),
@@ -154,7 +162,7 @@ async def list_scripts(name: str, session: Session) -> ScriptList:
     by_script = await versions.versions_by_script(session, [s.id for s in scripts])
     return ScriptList(
         site=name,
-        scripts=[ScriptOut.model_validate(_script_out(s, by_script[s.id])) for s in scripts],
+        scripts=[ScriptOut.model_validate(script_out(s, by_script[s.id])) for s in scripts],
     )
 
 
@@ -164,7 +172,7 @@ async def get_script(name: str, script_id: uuid.UUID, session: Session) -> Scrip
     script = await versions.get_script(session, name, script_id)
     history = (await versions.versions_by_script(session, [script.id]))[script.id]
     return ScriptDetail.model_validate(
-        {**_script_out(script, history), "versions": [VersionOut.of(v) for v in history]}
+        {**script_out(script, history), "versions": [VersionOut.of(v) for v in history]}
     )
 
 

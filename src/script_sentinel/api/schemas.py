@@ -9,7 +9,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from script_sentinel.config import MAX_SCAN_INTERVAL_HOURS
 from script_sentinel.db.models import (
+    ApprovalScope,
+    AuthorizationEvent,
     AuthorizationStatus,
+    ChangePolicy,
+    Decision,
+    Policy,
+    PolicyKind,
     ScanStatus,
     ScanTrigger,
     ScriptFetchOutcome,
@@ -110,6 +116,9 @@ class ScanOut(BaseModel):
     scripts_fetch_failed: int
     versions_new: int
     scripts_changed: int
+    scripts_approved: int
+    scripts_pending: int
+    scripts_rejected: int
 
 
 class ScanList(BaseModel):
@@ -141,6 +150,9 @@ class ObservationOut(BaseModel):
     )
     sri_status: SriStatus | None = Field(
         description="For scripts with an integrity attribute: what a browser would do."
+    )
+    authorization_status: AuthorizationStatus | None = Field(
+        description="The script's authorization status when this scan finished."
     )
 
 
@@ -194,6 +206,8 @@ class VersionOut(BaseModel):
     size_bytes: int
     first_seen_at: datetime
     last_seen_at: datetime
+    approved_at: datetime | None = Field(description="When this exact body was approved.")
+    approved_by: str | None = Field(description="Who approved it (policy:<id> for a policy).")
 
     @classmethod
     def of(cls, version: ScriptVersion) -> VersionOut:
@@ -205,6 +219,8 @@ class VersionOut(BaseModel):
             size_bytes=version.size_bytes,
             first_seen_at=version.first_seen_at,
             last_seen_at=version.last_seen_at,
+            approved_at=version.approved_at,
+            approved_by=version.approved_by,
         )
 
 
@@ -213,7 +229,14 @@ class ScriptOut(BaseModel):
     kind: ScriptKind
     locator: str
     status: AuthorizationStatus
+    status_reason: str | None = Field(description="Why the status is what it is.")
+    status_changed_at: datetime | None
+    policy_id: uuid.UUID | None = Field(description="The policy that authorized it, if any.")
+    decision: Decision | None = Field(description="A person's decision, if any.")
+    approval_scope: ApprovalScope | None
     justification: str | None
+    decided_by: str | None
+    decided_at: datetime | None
     first_seen_at: datetime
     last_seen_at: datetime
     version_count: int
@@ -227,3 +250,150 @@ class ScriptDetail(ScriptOut):
 class ScriptList(BaseModel):
     site: str
     scripts: list[ScriptOut]
+
+
+_ACTOR = Field(
+    min_length=1,
+    max_length=128,
+    description="Who is making the change. Recorded in the audit trail.",
+    examples=["alice@example.com"],
+)
+
+
+class ApproveIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = _ACTOR
+    justification: str = Field(
+        min_length=1,
+        max_length=2000,
+        description="Why the script is necessary (PCI DSS 6.4.3).",
+        examples=["Payment form provided by our PSP; required for card entry."],
+    )
+    scope: ApprovalScope = Field(
+        default=ApprovalScope.PINNED,
+        description="pinned: the bodies served now; any_version: the vendor is expected to "
+        "change the script.",
+    )
+
+
+class RejectIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = _ACTOR
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class PolicyCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: PolicyKind
+    match: str = Field(
+        min_length=1,
+        max_length=2048,
+        description="An origin, a URL prefix, or a SHA-384 (hex or sha384-<base64>).",
+        examples=["https://js.payments.example"],
+    )
+    change: ChangePolicy = Field(
+        default=ChangePolicy.PINNED,
+        description="pinned approves the first body seen and flags any other; "
+        "expected_to_change accepts every body. Hash policies are always pinned.",
+    )
+    ignore_query: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Query parameters dropped from matching URLs before they become "
+        "inventory locators (cache busters). ['*'] drops the whole query.",
+        examples=[["v"]],
+    )
+    justification: str = Field(min_length=1, max_length=2000)
+    actor: str = _ACTOR
+
+
+class PolicyOut(BaseModel):
+    id: uuid.UUID
+    kind: PolicyKind
+    match: str
+    change: ChangePolicy
+    ignore_query: list[str]
+    justification: str
+    created_by: str
+    created_at: datetime
+
+    @classmethod
+    def of(cls, policy: Policy) -> PolicyOut:
+        return cls(
+            id=policy.id,
+            kind=policy.kind,
+            match=policy.match,
+            change=policy.change,
+            ignore_query=list(policy.ignore_query),
+            justification=policy.justification,
+            created_by=policy.created_by,
+            created_at=policy.created_at,
+        )
+
+
+class PolicyList(BaseModel):
+    site: str
+    policies: list[PolicyOut]
+
+
+class StatusChangeOut(BaseModel):
+    script_id: uuid.UUID
+    locator: str
+    from_status: AuthorizationStatus | None
+    to_status: AuthorizationStatus
+
+
+class PolicyChangeOut(BaseModel):
+    policy: PolicyOut | None = Field(description="The new policy (absent after a removal).")
+    scripts_changed: list[StatusChangeOut]
+
+
+class AuditEventOut(BaseModel):
+    seq: int
+    action: str
+    actor: str
+    script_id: uuid.UUID | None
+    policy_id: uuid.UUID | None
+    locator: str | None
+    from_status: str | None
+    to_status: str | None
+    reason: str | None
+    detail: dict[str, object]
+    created_at: datetime
+    prev_hash: str
+    hash: str
+
+    @classmethod
+    def of(cls, event: AuthorizationEvent) -> AuditEventOut:
+        return cls(
+            seq=event.seq,
+            action=event.action,
+            actor=event.actor,
+            script_id=event.script_id,
+            policy_id=event.policy_id,
+            locator=event.locator,
+            from_status=event.from_status,
+            to_status=event.to_status,
+            reason=event.reason,
+            detail=event.detail,
+            created_at=event.created_at,
+            prev_hash=event.prev_hash,
+            hash=event.hash,
+        )
+
+
+class AuditList(BaseModel):
+    site: str
+    events: list[AuditEventOut]
+
+
+class ChainOut(BaseModel):
+    site: str
+    ok: bool
+    events: int = Field(description="Events verified (up to the first break, if any).")
+    head_hash: str = Field(description="Hash of the last verified event; keep it elsewhere.")
+    first_bad_seq: int | None
+    problem: str | None
