@@ -122,12 +122,43 @@ jobs:
                  | .[0].sri_status == "match"' "$scan"
           jq -e '.snapshots[0].security_headers["content-security-policy-report-only"] | length == 1' "$scan"
           .venv/bin/sentinel scripts list demo --json | jq -e 'length == 7 and all(.version_count == 1)'
-          # The vendor ships a new analytics tag: a new version of the same script.
+          jq -e '.authorization == {"approved": 0, "pending": 7, "rejected": 0}' "$scan"
+          # Unapproved scripts on a payment page fail the gate with exit code 4.
+          set +e
+          .venv/bin/sentinel scan run demo --fail-on-unauthorized > /dev/null
+          test $? -eq 4
+          set -e
+          # Authorize the inventory: first-party code by origin, the PSP library pinned by
+          # hand, the analytics vendor pinned on first use, and the inline blocks one by one.
+          export SENTINEL_ACTOR=ci
+          .venv/bin/sentinel policies add demo --origin http://127.0.0.1:8000 \
+            --expected-to-change -j "First-party code" --json \
+            | jq -e '.scripts_changed | length == 2'
+          .venv/bin/sentinel scripts approve demo http://127.0.0.1:8001/payments/v3/elements.js \
+            -j "PSP card fields"
+          .venv/bin/sentinel policies add demo --prefix http://127.0.0.1:8001/analytics/ \
+            -j "Analytics; review every change"
+          .venv/bin/sentinel scripts list demo --json \
+            | jq -r '.[] | select(.kind == "inline") | .locator' \
+            | while read -r locator; do
+                .venv/bin/sentinel scripts approve demo "$locator" -j "Reviewed inline block"
+              done
+          .venv/bin/sentinel scan run demo --fail-on-unauthorized --json \
+            | jq -e '.authorization == {"approved": 7, "pending": 0, "rejected": 0}'
+          # The vendor ships a new analytics tag: a new version of the same script, which the
+          # pinning policy sends back to review, and the gate fails again.
           echo 'queue.push(["ping"]);' >> examples/fixture-cdn/analytics/v2/tag.js
-          .venv/bin/sentinel scan run demo --json \
-            | jq -e '.scripts.new == 0 and .scripts.versions_new == 1 and .scripts.changed == 1'
+          set +e
+          .venv/bin/sentinel scan run demo --fail-on-unauthorized --json > "$scan"
+          test $? -eq 4
+          set -e
+          jq -e '.scripts.new == 0 and .scripts.versions_new == 1 and .scripts.changed == 1
+                 and .authorization.pending == 1' "$scan"
           .venv/bin/sentinel scripts show demo http://127.0.0.1:8001/analytics/v2/tag.js --json \
-            | jq -e '.version_count == 2'
+            | jq -e '.version_count == 2 and .status == "pending"'
+          .venv/bin/sentinel audit list demo --json --limit 1 \
+            | jq -e '.[0].action == "script.status_changed" and .[0].to_status == "pending"'
+          .venv/bin/sentinel audit verify demo --json | jq -e '.ok and .events == 17'
           git checkout -- examples/fixture-cdn
           # A page that fails makes `scan run` exit 3.
           .venv/bin/sentinel pages add demo http://127.0.0.1:8000/missing.html

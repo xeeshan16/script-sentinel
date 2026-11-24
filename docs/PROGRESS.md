@@ -232,3 +232,101 @@ SRI values, and snapshot the security headers (CSP, HSTS and others) for 11.6.1.
 **Next (day 4):** the authorization workflow for 6.4.3. Approve, reject or justify each
 script with an audit trail, and policies: allowlisted origins, pinned hashes, and vendors
 that are expected to change (with cache-busting query normalization).
+
+## Day 4 — 2026-11-24: authorization workflow (6.4.3)
+
+**Done**
+
+- `authorization.py`: each script's `status` is now derived, never set by hand, from three
+  inputs, in this order:
+  - a person's **decision**: approve with a written justification, either `pinned` to the
+    bodies served now or for `any_version`, or reject;
+  - the site's **policies**: `origin`, `prefix` (a vendor's SDK path) and `hash` (one exact
+    body, inline code included). Origin and prefix policies are `expected_to_change` or
+    `pinned`; a pinning policy approves the first body it sees (trust on first use) and
+    records which one;
+  - the **bodies the script serves now** (`scripts.current_version_ids`) and which of them
+    were approved (`script_versions.approved_at`/`approved_by`).
+
+  A rejection always wins. A pinned approval holds while every current body was approved or
+  matches a hash policy; otherwise the script is `pending` again. A per-script pin is
+  deliberate, so a broad "expected to change" origin policy doesn't override it. Without a
+  decision, hash policies come first, then the most specific origin or prefix policy (the
+  longest prefix, then the origin). `evaluate()` is a pure function, unit-tested on its own.
+- Statuses are recomputed after every scan, decision and policy change. A failed fetch
+  never flips a status: the script keeps the bodies it last served successfully. Going back
+  to an approved body makes a pinned script `approved` again.
+- **Cache busters:** origin and prefix policies can drop query parameters
+  (`ignore_query: ["v"]` or `["*"]`) before a URL becomes a locator, so `tag.js?v=1` and
+  `tag.js?v=2` are versions of one script. The other parameters keep their order and
+  encoding. Several URLs can now map to one script within a scan, so `script_fetches` is
+  unique per `(scan, url)` instead of `(scan, script)`. Prefixes always end in a path, so
+  `https://cdn.vendor.com/` can't match `https://cdn.vendor.com.evil.test/`.
+- `audit.py`: an append-only audit trail per site. Every decision, policy change and status
+  change (including a script's first evaluation, so the trail shows when each script entered
+  the inventory) is an `authorization_events` row numbered per site, carrying the SHA-256 of
+  the previous event and of its own canonical JSON. Appends lock the site row
+  (`SELECT … FOR UPDATE`) so concurrent writers can't fork the chain. Event ids for scripts
+  and policies are plain columns, not foreign keys: the hash covers them, so a cascading
+  `SET NULL` would break the chain, and events have to outlive what they mention.
+  `verify_chain` walks the trail in keyset pages and reports the first missing, edited or
+  relinked event.
+- Scans record each observation's authorization status as of the end of the scan, plus
+  `scripts_approved`/`pending`/`rejected` counters, so old scans stay accurate evidence.
+- Migration `0004`: `policies`, `authorization_events`, decision and status columns on
+  `scripts`, approval columns on `script_versions`, the scan counters, the observation
+  status, and the new `script_fetches` constraint. The downgrade keeps one fetch per script
+  per scan where a query rule had mapped several URLs to one script.
+- **SQLite migrations now run with foreign keys off** and finish with
+  `PRAGMA foreign_key_check`. Adding a foreign key to `scripts` needs a table rebuild on
+  SQLite, and with foreign keys on, dropping the old table would have cascade-deleted every
+  observation, version and fetch. A new test scans, downgrades to 0003 and upgrades again,
+  and checks the rows survive; it fails if the pragma is switched back on.
+- API: `POST /v1/sites/{name}/scripts/{id}/approve|reject|reset`,
+  `GET|POST /v1/sites/{name}/policies`, `DELETE /v1/sites/{name}/policies/{id}`,
+  `GET /v1/sites/{name}/audit` and `/audit/verify`. Script responses carry the decision,
+  scope, justification, status reason and authorizing policy; versions carry who approved
+  them. Policy changes return the scripts whose status changed.
+- CLI: `sentinel scripts approve|reject|reset`, `sentinel policies add|list|remove`,
+  `sentinel audit list|verify` (exits 1 on a broken chain). The actor comes from `--actor`,
+  `SENTINEL_ACTOR` or the login name. `scan run` shows each script's status, prints an
+  authorization summary, warns when a payment page runs unapproved scripts, and with
+  `--fail-on-unauthorized` exits 4 in that case (it wins over exit 3).
+- CI: the fixture smoke test authorizes the demo inventory with two policies and four
+  approvals, checks the gate passes, changes the analytics tag, and checks the script goes
+  back to `pending`, the gate fails with exit 4, and the audit trail verifies with 17
+  events.
+
+**Tests**
+
+- 358 tests locally on Python 3.13 against SQLite and PostgreSQL 16 (54 new): pure rule
+  tests (`test_policy_rules.py`), real scans against the two local servers
+  (`test_authorization.py`: pinned approvals lapsing and coming back, rejection over
+  policies, reset, trust on first use, hash policies on inline code, policy removal, query
+  folding with two URLs in one scan, a failed fetch, tampering by edit, delete and
+  re-hashing), API and CLI tests, and the migration data test. Line and branch coverage is
+  100% with PostgreSQL configured; the suite also passes on Python 3.12 (SQLite). Ruff and
+  mypy (strict) are clean.
+- Both CI smoke scripts were run locally against PostgreSQL 16 before pushing, and the
+  README output comes from real runs.
+
+**Plan changes**
+
+- Day 13 now also adds API keys. Until then the API records the `actor` given in the
+  request body, which is only trustworthy on a trusted network; the README says so.
+- Day 12's evidence export will include the audit trail's verified head hash, which is what
+  makes the chain useful against someone who can rewrite the whole table.
+
+**Known limitations (deliberate for now)**
+
+- A new `ignore_query` rule applies from the next scan on. Scripts already recorded under a
+  URL with the cache buster stay in the inventory under their old locators (and stop being
+  seen).
+- Deciding about many scripts at once (for example, approving every inline block of a page)
+  is one call per script. A bulk endpoint can come with the evidence work if it's needed.
+- Changes still don't raise findings or alerts; that's days 5, 6 and 10.
+
+**Next (day 5):** change detection and diff. A JS-aware token diff between a script's
+versions, size and entropy deltas, newly referenced domains and URLs, and findings with a
+severity. Also match inline blocks by content before position, so inserting one doesn't
+make the ones after it look changed.

@@ -12,12 +12,14 @@ code runs on your checkout page with your users' trust. script-sentinel keeps an
 every script your pages load, pins what each one should look like, and tells you when one
 changes and whether the change looks like a skimmer.
 
-> **Status: in active development (day 3 of 14).** Scans fetch your pages, inventory every
+> **Status: in active development (day 4 of 14).** Scans fetch your pages, inventory every
 > script they load, download and hash every script body, keep a version history per script,
 > check `integrity` attributes the way a browser does, and snapshot each page's security
-> headers. The approve-and-justify workflow (PCI DSS 6.4.3) lands on day 4. See
-> [docs/PLAN.md](docs/PLAN.md) for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for
-> the daily log.
+> headers. Every script is approved (with a written justification), rejected or pending,
+> by hand or through origin, prefix and hash policies, and a vendor change sends a pinned
+> script back to review. Every decision and status change lands in a hash-chained audit
+> trail. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and
+> [docs/PROGRESS.md](docs/PROGRESS.md) for the daily log.
 
 ## Why
 
@@ -42,7 +44,8 @@ changes and whether the change looks like a skimmer.
 | Versions | Every body (inline or external) hashed with SHA-384 over the exact bytes and over a comment- and whitespace-insensitive JS token stream; a version history per script, so a vendor change is a new version of the same script | ✅ day 3 |
 | Integrity | `integrity` attributes checked the way browsers do (strongest algorithm wins); SRI values to pin each body; CSP hash sources for inline code; a warning for SRI on a cross-origin script without `crossorigin` | ✅ day 3 |
 | Headers (11.6.1) | CSP, CSP-Report-Only, Integrity-Policy, HSTS, `X-Content-Type-Options` and other security headers, plus `<meta>` CSPs, snapshotted per page per scan | ✅ day 3 |
-| Authorization (6.4.3) | Approve or justify each script; pinned hashes, allowlisted origins, "expected to change" vendors; audit trail | day 4 |
+| Authorization (6.4.3) | Approve (pinned to the current bodies, or for any version) or reject each script with a written justification; origin, URL-prefix and hash policies, either pinned on first use or "expected to change"; cache-busting query parameters folded into one script; `scan run --fail-on-unauthorized` gates a pipeline on payment pages | ✅ day 4 |
+| Audit trail | Every decision, policy change and status change, append-only and SHA-256 hash-chained per site, with a verifier that finds the first edited, removed or reordered event | ✅ day 4 |
 | Change review | JS-aware tokenized diff, size and entropy deltas, newly referenced domains | day 5 |
 | Skimmer heuristics | New exfiltration sinks, card-field listeners, wallet-address swaps, obfuscation, script injection | day 6 |
 | CSP reports | `report-uri` and Reporting API collector with dedupe, rate limits, batch ingest and optional Kafka | days 7–8 |
@@ -62,7 +65,8 @@ flowchart LR
     worker["Scan worker<br/>(day 10)"] --> scanner["Scanner<br/>fetch → parse → hash"]
     scans["/v1/sites/{name}/scans"] --> scanner
     scanner --> store[("PostgreSQL<br/>sites · pages · scripts<br/>versions · findings")]
-    scanner --> policy["Policy engine<br/>approved · pinned · changed"]
+    scanner --> policy["Authorization<br/>decisions · policies"]
+    policy --> trail[("Audit trail<br/>hash-chained")]
     policy --> diff["Diff + heuristics"]
     diff --> findings["Findings"] --> outbox["Outbox"] --> hooks["Signed webhooks"]
     sites --> store
@@ -87,6 +91,9 @@ erDiagram
     SCAN ||--o{ SCRIPT_FETCH : downloads
     SCRIPT ||--o{ SCRIPT_FETCH : "fetched as"
     SCRIPT_VERSION |o--o{ SCRIPT_FETCH : got
+    SITE ||--o{ POLICY : "authorizes with"
+    POLICY |o--o{ SCRIPT : "approved by"
+    SITE ||--o{ AUTHORIZATION_EVENT : "audit trail"
     SITE {
         uuid id
         string name
@@ -102,6 +109,7 @@ erDiagram
         int pages_failed
         int scripts_new
         int scripts_changed
+        int scripts_pending "after authorization"
     }
     PAGE_SNAPSHOT {
         enum outcome "ok | robots_disallowed | http_error | ..."
@@ -118,6 +126,7 @@ erDiagram
         string nonce_digest "never the nonce itself"
         string inline_sha384
         enum sri_status "match | mismatch | no_supported_hash | unverified"
+        enum authorization_status "status when the scan finished"
     }
     SCRIPT_FETCH {
         enum outcome "ok | http_error | too_large | ..."
@@ -132,14 +141,35 @@ erDiagram
     SCRIPT {
         enum kind "external | inline"
         string locator "src URL, or page + position"
-        enum status "pending | approved | rejected"
+        enum status "pending | approved | rejected (derived)"
+        enum decision "approved | rejected | null"
+        enum approval_scope "pinned | any_version"
         text justification
+        string status_reason
+        json current_version_ids
     }
     SCRIPT_VERSION {
         string sha384 "unique per script"
         string normalized_sha384
         int size_bytes
         text content
+        string approved_by "person or policy"
+    }
+    POLICY {
+        enum kind "origin | prefix | hash"
+        string match
+        enum change "pinned | expected_to_change"
+        json ignore_query "cache busters"
+        text justification
+    }
+    AUTHORIZATION_EVENT {
+        int seq "per site"
+        string action
+        string actor
+        string from_status
+        string to_status
+        string prev_hash
+        string hash "sha256 of the event"
     }
     FINDING {
         string kind
@@ -191,11 +221,41 @@ Design notes:
   `SENTINEL_MAX_SCRIPT_BYTES`, and hashed in a worker thread.
 - **Stored third-party code never runs on the sentinel's origin.** Version bodies are served
   as `text/plain` with `nosniff` and a sandboxing CSP.
+- **Status is derived, never set.** A script's status comes from a person's decision, the
+  site's policies and the bodies it serves right now, in that order: a rejection always
+  wins; an approval is either *pinned* to the bodies that were reviewed or for *any
+  version*; without a decision a hash policy approves exact bodies, then the most specific
+  origin or prefix policy applies. A per-script pin is deliberate, so a broad "expected to
+  change" origin policy doesn't override it. Statuses are recomputed after every scan,
+  decision and policy change.
+- **Pinned means pinned.** A pinned approval or a pinning policy covers the exact SHA-384 of
+  the bodies approved. When the vendor ships a new body the script is `pending` again, and
+  going back to an approved body makes it `approved` again. A pinning policy trusts the
+  first body it sees (trust on first use) and records which one. A failed fetch never
+  changes a status: the script keeps the bodies it last served successfully.
+- **One script per vendor file, not per cache buster.** Origin and prefix policies can drop
+  query parameters (`ignore_query: ["v"]`, or `["*"]`) before a URL becomes a locator, so
+  `tag.js?v=123` and `tag.js?v=124` are two versions of one script. The remaining
+  parameters keep their order and exact encoding. Prefixes always end in a path, so
+  `https://cdn.vendor.com/` can't match `https://cdn.vendor.com.evil.test/`.
+- **A tamper-evident audit trail.** Each event stores the SHA-256 of the previous event and
+  of its own canonical JSON, numbered per site; appends lock the site row
+  (`SELECT … FOR UPDATE`) so concurrent writers can't fork the chain. Events keep plain ids
+  (not foreign keys) because the hash covers them, and they outlive the scripts and
+  policies they mention. `sentinel audit verify` reports the first event that was edited,
+  removed or reordered. Someone with database write access could rebuild the whole chain,
+  so the head hash is worth keeping elsewhere; day 12's evidence export does that.
+- **Scans record what was authorized at the time.** Each script observation keeps its
+  status as of the end of that scan, so old scans stay accurate evidence after later
+  decisions.
 - **Findings outlive the scripts they're about.** Deleting a script sets the reference on its
   findings to `NULL` instead of deleting them; they are audit evidence.
 - **Portable schema.** Enums are `VARCHAR` + `CHECK`, JSON is `JSONB` on PostgreSQL, and
   timestamps are timezone-aware UTC on both PostgreSQL and SQLite. A test asserts the ORM
-  models and the hand-written migrations match.
+  models and the hand-written migrations match. SQLite migrations run with foreign keys
+  off (as SQLite's own guide for table rebuilds says) and end with
+  `PRAGMA foreign_key_check`, and a test checks that rebuilding `scripts` keeps the rows
+  that reference it.
 
 ## Quick start
 
@@ -240,35 +300,40 @@ uv run sentinel pages add demo http://127.0.0.1:8000/checkout.html --payment --l
 
 ```console
 $ uv run sentinel scan run demo
-scan 8d81462d-7f10-4b4e-bd33-9a1654a374bf of demo: completed in 0.04s (2 pages: 1 ok, 1 skipped)
+scan 315560ae-c208-4bb8-8e3e-b5cd0e8c9057 of demo: completed in 0.10s (2 pages: 1 ok, 1 skipped)
   robots   http://127.0.0.1:8000/checkout.html [payment]  disallowed by robots.txt (parsed)
   ok       http://127.0.0.1:8000/index.html  200  3 scripts (3 new)
       headers: nosniff, Referrer-Policy
-      + http://127.0.0.1:8000/js/app.js  (classic)  sha384-oaeGFW/oKjuWczG…
-      + http://127.0.0.1:8001/analytics/v2/tag.js  (classic)  sha384-raygKpbLnYdKgM3…
-      + http://127.0.0.1:8000/index.html#inline-1  (classic)  sha384-uSDeh2gpqss7OOr…
-inventory: 3 scripts seen, 3 new (pending approval)
+      + http://127.0.0.1:8000/js/app.js  (classic, pending)  sha384-oaeGFW/oKjuWczG…
+      + http://127.0.0.1:8001/analytics/v2/tag.js  (classic, pending)  sha384-raygKpbLnYdKgM3…
+      + http://127.0.0.1:8000/index.html#inline-1  (classic, pending)  sha384-uSDeh2gpqss7OOr…
+inventory: 3 scripts seen, 3 new
+authorization: 0 approved, 3 pending, 0 rejected
 bodies: 2 external fetched, 0 failed; 3 new versions, 0 scripts changed
 warning: robots.txt kept payment pages out of this scan; if they are your own pages, run: sentinel sites update demo --ignore-robots
 $ uv run sentinel sites update demo --ignore-robots
 updated site demo: scan every 168h, robots.txt ignored
-$ uv run sentinel scan run demo
-scan 2167fba1-1378-4aa3-aa2c-0cd23cdf758a of demo: completed in 0.04s (2 pages: 2 ok)
+$ uv run sentinel scan run demo --fail-on-unauthorized
+scan ea5b83a1-5905-4612-9e4c-d73d04cad72e of demo: completed in 0.09s (2 pages: 2 ok)
   ok       http://127.0.0.1:8000/checkout.html [payment]  200  6 scripts (4 new)
       headers: CSP report-only, nosniff, Referrer-Policy
-      + http://127.0.0.1:8000/checkout.html#inline-1  (classic, nonce)  sha384-lXDOInm1aF5PqqU…
-      + http://127.0.0.1:8000/checkout.html#inline-2  (importmap)  sha384-RK3hVJoVsFjKTgJ…
-        http://127.0.0.1:8000/js/app.js  (classic)  sha384-oaeGFW/oKjuWczG…
-        http://127.0.0.1:8001/analytics/v2/tag.js  (classic)  sha384-raygKpbLnYdKgM3…
-      + http://127.0.0.1:8001/payments/v3/elements.js  (classic, integrity ok)  sha384-i+C8D+bUmsEtpaC…
-      + http://127.0.0.1:8000/js/checkout.mjs  (module)  sha384-V9XBxb1rMJcHI5I…
+      + http://127.0.0.1:8000/checkout.html#inline-1  (classic, pending, nonce)  sha384-lXDOInm1aF5PqqU…
+      + http://127.0.0.1:8000/checkout.html#inline-2  (importmap, pending)  sha384-RK3hVJoVsFjKTgJ…
+        http://127.0.0.1:8000/js/app.js  (classic, pending)  sha384-oaeGFW/oKjuWczG…
+        http://127.0.0.1:8001/analytics/v2/tag.js  (classic, pending)  sha384-raygKpbLnYdKgM3…
+      + http://127.0.0.1:8001/payments/v3/elements.js  (classic, pending, integrity ok)  sha384-i+C8D+bUmsEtpaC…
+      + http://127.0.0.1:8000/js/checkout.mjs  (module, pending)  sha384-V9XBxb1rMJcHI5I…
   ok       http://127.0.0.1:8000/index.html  200  3 scripts
       headers: nosniff, Referrer-Policy
-        http://127.0.0.1:8000/js/app.js  (classic)  sha384-oaeGFW/oKjuWczG…
-        http://127.0.0.1:8001/analytics/v2/tag.js  (classic)  sha384-raygKpbLnYdKgM3…
-        http://127.0.0.1:8000/index.html#inline-1  (classic)  sha384-uSDeh2gpqss7OOr…
-inventory: 7 scripts seen, 4 new (pending approval)
+        http://127.0.0.1:8000/js/app.js  (classic, pending)  sha384-oaeGFW/oKjuWczG…
+        http://127.0.0.1:8001/analytics/v2/tag.js  (classic, pending)  sha384-raygKpbLnYdKgM3…
+        http://127.0.0.1:8000/index.html#inline-1  (classic, pending)  sha384-uSDeh2gpqss7OOr…
+inventory: 7 scripts seen, 4 new
+authorization: 0 approved, 7 pending, 0 rejected
 bodies: 4 external fetched, 0 failed; 4 new versions, 0 scripts changed
+warning: payment pages run 6 scripts that are not approved (PCI DSS 6.4.3); review them with: sentinel scripts list demo
+$ echo $?
+4
 $ uv run sentinel scripts list demo
 pending   external  v1   sha384-oaeGFW/oKjuWczG…   http://127.0.0.1:8000/js/app.js
 pending   external  v1   sha384-V9XBxb1rMJcHI5I…   http://127.0.0.1:8000/js/checkout.mjs
@@ -280,51 +345,109 @@ pending   inline    v1   sha384-uSDeh2gpqss7OOr…   http://127.0.0.1:8000/index
 ```
 
 `+` marks a script seen for the first time. Every new script starts as `pending`: under PCI
-DSS 6.4.3 it needs an authorization and a written justification (day 4). The checkout page
-pins the payments library with SRI, and the scan confirms a browser would accept the body
-it got (`integrity ok`). The JSON `application/ld+json` block on the checkout page is
-counted but not inventoried, because it never runs.
+DSS 6.4.3 each script on a payment page needs an authorization and a written
+justification. With `--fail-on-unauthorized`, `scan run` exits 4 while a payment page runs
+anything that isn't approved, so it can gate a deploy or a cron job. The checkout page pins
+the payments library with SRI, and the scan confirms a browser would accept the body it got
+(`integrity ok`). The JSON `application/ld+json` block on the checkout page is counted but
+not inventoried, because it never runs.
+
+### Authorize scripts (PCI DSS 6.4.3)
+
+Approve first-party code by origin, pin the payment library by hand, let the analytics
+vendor's first body be pinned by a policy, and approve the inline blocks one by one. Who
+did it comes from `--actor`, `SENTINEL_ACTOR` or the login name:
+
+```console
+$ export SENTINEL_ACTOR=zeeshan
+$ uv run sentinel policies add demo --origin http://127.0.0.1:8000 --expected-to-change \
+    -j "First-party code, shipped by our own pipeline"
+added policy bf7054aa-f9b1-4d4d-a03e-56c2ebe580d0: origin policy http://127.0.0.1:8000
+  pending -> approved: http://127.0.0.1:8000/js/app.js  (approved by origin policy http://127.0.0.1:8000 (expected to change))
+  pending -> approved: http://127.0.0.1:8000/js/checkout.mjs  (approved by origin policy http://127.0.0.1:8000 (expected to change))
+$ uv run sentinel scripts approve demo http://127.0.0.1:8001/payments/v3/elements.js \
+    -j "PSP card fields; required to take payments"
+approved: http://127.0.0.1:8001/payments/v3/elements.js
+  why: approved by zeeshan
+$ uv run sentinel policies add demo --prefix http://127.0.0.1:8001/analytics/ \
+    -j "Analytics tag; every new version needs a review"
+added policy 037b1087-f17d-4053-8267-b0f8d7d994fa: prefix policy http://127.0.0.1:8001/analytics/
+  pending -> approved: http://127.0.0.1:8001/analytics/v2/tag.js  (approved by prefix policy http://127.0.0.1:8001/analytics/, pinned to the first body seen)
+$ uv run sentinel scripts approve demo 'http://127.0.0.1:8000/checkout.html#inline-1' \
+    -j "Checkout config: currency and locale"
+approved: http://127.0.0.1:8000/checkout.html#inline-1
+  why: approved by zeeshan
+$ # ...and the same for checkout.html#inline-2 (the import map) and index.html#inline-1
+$ uv run sentinel scan run demo --fail-on-unauthorized | tail -3
+inventory: 7 scripts seen, 0 new
+authorization: 7 approved, 0 pending, 0 rejected
+bodies: 4 external fetched, 0 failed; 0 new versions, 0 scripts changed
+```
+
+`scripts approve` pins the bodies the script serves now; `--any-version` approves whatever
+the vendor serves. `scripts reject` overrides every policy, and `scripts reset` withdraws a
+decision. `policies add --hash` approves one exact body wherever it appears (inline code
+included), and `--ignore-query v` on an origin or prefix policy folds `tag.js?v=123` and
+`tag.js?v=124` into one script.
+
+### When a vendor changes a script
 
 Now play the vendor: the analytics tag on the CDN changes, with no deploy on the shop's side.
 
 ```console
 $ echo 'queue.push(["ping"]);' >> examples/fixture-cdn/analytics/v2/tag.js
-$ uv run sentinel scan run demo
-scan 869bc596-a6ee-421e-9c18-7d7978d7c132 of demo: completed in 0.04s (2 pages: 2 ok)
+$ uv run sentinel scan run demo --fail-on-unauthorized
+scan 1dcaac2b-b456-4258-a5ec-bf2d51f4469c of demo: completed in 0.08s (2 pages: 2 ok)
   ok       http://127.0.0.1:8000/checkout.html [payment]  200  6 scripts
       headers: CSP report-only, nosniff, Referrer-Policy
-        http://127.0.0.1:8000/checkout.html#inline-1  (classic, nonce)  sha384-lXDOInm1aF5PqqU…
-        http://127.0.0.1:8000/checkout.html#inline-2  (importmap)  sha384-RK3hVJoVsFjKTgJ…
-        http://127.0.0.1:8000/js/app.js  (classic)  sha384-oaeGFW/oKjuWczG…
-      ~ http://127.0.0.1:8001/analytics/v2/tag.js  (classic)  sha384-5R5tM2xxeboPVK+…
-        http://127.0.0.1:8001/payments/v3/elements.js  (classic, integrity ok)  sha384-i+C8D+bUmsEtpaC…
-        http://127.0.0.1:8000/js/checkout.mjs  (module)  sha384-V9XBxb1rMJcHI5I…
+        http://127.0.0.1:8000/checkout.html#inline-1  (classic, approved, nonce)  sha384-lXDOInm1aF5PqqU…
+        http://127.0.0.1:8000/checkout.html#inline-2  (importmap, approved)  sha384-RK3hVJoVsFjKTgJ…
+        http://127.0.0.1:8000/js/app.js  (classic, approved)  sha384-oaeGFW/oKjuWczG…
+      ~ http://127.0.0.1:8001/analytics/v2/tag.js  (classic, pending)  sha384-5R5tM2xxeboPVK+…
+        http://127.0.0.1:8001/payments/v3/elements.js  (classic, approved, integrity ok)  sha384-i+C8D+bUmsEtpaC…
+        http://127.0.0.1:8000/js/checkout.mjs  (module, approved)  sha384-V9XBxb1rMJcHI5I…
   ok       http://127.0.0.1:8000/index.html  200  3 scripts
       headers: nosniff, Referrer-Policy
-        http://127.0.0.1:8000/js/app.js  (classic)  sha384-oaeGFW/oKjuWczG…
-      ~ http://127.0.0.1:8001/analytics/v2/tag.js  (classic)  sha384-5R5tM2xxeboPVK+…
-        http://127.0.0.1:8000/index.html#inline-1  (classic)  sha384-uSDeh2gpqss7OOr…
-inventory: 7 scripts seen, 0 new (pending approval)
+        http://127.0.0.1:8000/js/app.js  (classic, approved)  sha384-oaeGFW/oKjuWczG…
+      ~ http://127.0.0.1:8001/analytics/v2/tag.js  (classic, pending)  sha384-5R5tM2xxeboPVK+…
+        http://127.0.0.1:8000/index.html#inline-1  (classic, approved)  sha384-uSDeh2gpqss7OOr…
+inventory: 7 scripts seen, 0 new
+authorization: 6 approved, 1 pending, 0 rejected
 bodies: 4 external fetched, 0 failed; 1 new versions, 1 scripts changed
+warning: payment pages run 1 scripts that are not approved (PCI DSS 6.4.3); review them with: sentinel scripts list demo
+$ echo $?
+4
 $ uv run sentinel scripts show demo http://127.0.0.1:8001/analytics/v2/tag.js
 http://127.0.0.1:8001/analytics/v2/tag.js
   kind: external   status: pending
-  seen: 2026-11-23 10:11:18Z .. 2026-11-23 10:11:21Z
+  why: the body changed since prefix policy http://127.0.0.1:8001/analytics/ pinned it
+  seen: 2026-11-24 10:14:41Z .. 2026-11-24 10:15:05Z
   versions (2, most recently seen first):
-    2026-11-23 10:11:21Z       231 bytes  sha384-5R5tM2xxeboPVK+WaFsUzTA2YwHEgRK/wn7ptQQByydFrdEChhOQ1FYewCG6Zj52
-    2026-11-23 10:11:19Z       209 bytes  sha384-raygKpbLnYdKgM3/yZTB+rNJEmEUx75tgDCpLy3OMpv6OlnikQK3g4yXoPd2vFCD
+    2026-11-24 10:15:05Z       231 bytes  sha384-5R5tM2xxeboPVK+WaFsUzTA2YwHEgRK/wn7ptQQByydFrdEChhOQ1FYewCG6Zj52
+    2026-11-24 10:15:04Z       209 bytes  sha384-raygKpbLnYdKgM3/yZTB+rNJEmEUx75tgDCpLy3OMpv6OlnikQK3g4yXoPd2vFCD  approved by policy:037b1087-f17d-4053-8267-b0f8d7d994fa
   pin the current body with:
     <script src="http://127.0.0.1:8001/analytics/v2/tag.js" integrity="sha384-5R5tM2xxeboPVK+WaFsUzTA2YwHEgRK/wn7ptQQByydFrdEChhOQ1FYewCG6Zj52" crossorigin="anonymous"></script>
+$ uv run sentinel audit list demo --script http://127.0.0.1:8001/analytics/v2/tag.js
+#17   2026-11-24 10:15:05Z  script.status_changed scan             approved -> pending   http://127.0.0.1:8001/analytics/v2/tag.js
+      the body changed since prefix policy http://127.0.0.1:8001/analytics/ pinned it
+#13   2026-11-24 10:14:53Z  script.status_changed zeeshan          pending -> approved   http://127.0.0.1:8001/analytics/v2/tag.js
+      approved by prefix policy http://127.0.0.1:8001/analytics/, pinned to the first body seen
+#3    2026-11-24 10:14:41Z  script.status_changed scan             new -> pending        http://127.0.0.1:8001/analytics/v2/tag.js
+      no decision or policy covers this script yet
+$ uv run sentinel audit verify demo
+audit trail of demo is intact: 17 events, head cca18508f36ae7be88031db77d8fd47f1ddc3d33268d6c7f698ca9d660ac5f78
 $ uv run sentinel scripts show demo 'http://127.0.0.1:8000/checkout.html#inline-1' | tail -1
   CSP hash source for the current body: 'sha384-lXDOInm1aF5PqqUrDg5CaId7/zhFcRp49CafOH2uDqHBYq9Cjkh80E/lvWCymFNd'
 $ git checkout -- examples/fixture-cdn    # put the fixture back
 ```
 
-`~` marks a script whose body changed: same script, new version. Judging whether that
-change is acceptable is the job of the authorization policies (day 4) and the diff and
-skimmer heuristics (days 5 and 6). `sentinel scan run` exits 3 when any page could not be
-inventoried, so it can gate a cron job or a pipeline; `--json` prints the whole scan,
-including each page's security headers and every script fetch.
+`~` marks a script whose body changed: same script, new version. The prefix policy pinned
+the first body, so the new one is `pending` until someone looks at it (approving it again,
+or `--any-version` if the vendor is trusted to change it), and the scan fails the gate.
+Judging *what* changed is the job of the diff and skimmer heuristics (days 5 and 6).
+`sentinel scan run` also exits 3 when any page could not be inventoried; `--json` prints
+the whole scan, including each page's security headers, every script fetch and each
+script's authorization status.
 
 (Output from a real run against PostgreSQL 16.)
 
@@ -353,7 +476,32 @@ $ curl -s -X POST localhost:8080/v1/sites/blog/pages -H 'content-type: applicati
 {"detail":"https://evil.test/ is not on an allowed origin of site 'blog' (https://blog.example.com)"}
 ```
 
-(Output above is from a real run against PostgreSQL 16; the JSON was pretty-printed.)
+Decisions and the audit trail work the same way over HTTP:
+
+```console
+$ curl -s -X POST localhost:8080/v1/sites/demo/scripts/$TAG_ID/approve \
+    -H 'content-type: application/json' \
+    -d '{"actor":"alice@example.com","justification":"Analytics vendor ships weekly; covered by contract","scope":"any_version"}' \
+    | jq '{status, status_reason, decision, approval_scope, decided_by}'
+{
+  "status": "approved",
+  "status_reason": "approved by alice@example.com for any version",
+  "decision": "approved",
+  "approval_scope": "any_version",
+  "decided_by": "alice@example.com"
+}
+$ curl -s localhost:8080/v1/sites/demo/audit/verify | jq .
+{
+  "site": "demo",
+  "ok": true,
+  "events": 19,
+  "head_hash": "d82e678d0e4e6c8b0898276c1b003d158e3a7742d47d23adc16c7cafb23a9b5a",
+  "first_bad_seq": null,
+  "problem": null
+}
+```
+
+(Output above is from real runs against PostgreSQL 16; the JSON was pretty-printed.)
 
 ## API
 
@@ -375,8 +523,18 @@ $ curl -s -X POST localhost:8080/v1/sites/blog/pages -H 'content-type: applicati
 | `GET` | `/v1/sites/{name}/scripts` | The site's script inventory with authorization status, version count and current SRI value |
 | `GET` | `/v1/sites/{name}/scripts/{id}` | One script with its version history (hashes, SRI, size, first and last seen) |
 | `GET` | `/v1/sites/{name}/scripts/{id}/versions/{version_id}/content` | One version's body, as `text/plain` with `nosniff` and a sandboxing CSP |
+| `POST` | `/v1/sites/{name}/scripts/{id}/approve` | Approve (`actor`, `justification`, `scope`: `pinned` or `any_version`); `422` for a pinned approval with no fetched body |
+| `POST` | `/v1/sites/{name}/scripts/{id}/reject` | Reject (`actor`, `reason`); overrides every policy |
+| `POST` | `/v1/sites/{name}/scripts/{id}/reset` | Withdraw the decision (`actor`, `reason`); `409` if there is none |
+| `GET` | `/v1/sites/{name}/policies` | The site's policies, oldest first |
+| `POST` | `/v1/sites/{name}/policies` | Add a policy (`kind`, `match`, `change`, `ignore_query`, `justification`, `actor`); returns the scripts whose status changed (`409` for a duplicate) |
+| `DELETE` | `/v1/sites/{name}/policies/{id}?actor=…&reason=…` | Remove a policy; returns the scripts whose status changed |
+| `GET` | `/v1/sites/{name}/audit?script_id=…&limit=100` | The audit trail, newest first |
+| `GET` | `/v1/sites/{name}/audit/verify` | Recompute the hash chain: `ok`, events verified, head hash, first bad event |
 
-`PATCH /v1/sites/{name}` also accepts `respect_robots`. A scan through the API runs inside
+`PATCH /v1/sites/{name}` also accepts `respect_robots`. The `actor` on authorization
+requests is recorded as given: the API has no authentication yet (day 13 adds it), so run
+it on a trusted network until then. A scan through the API runs inside
 the request for now; scheduled background scans arrive with the worker on day 10.
 
 ## Configuration
@@ -392,6 +550,7 @@ the request for now; scheduled background scans arrive with the worker on day 10
 | `SENTINEL_MAX_SCRIPT_BYTES` | `5242880` | Larger external scripts are reported as `too_large` instead of hashed |
 | `SENTINEL_MAX_REDIRECTS` | `5` | Redirect hops per page or script |
 | `SENTINEL_SCAN_CONCURRENCY` | `4` | Pages fetched at once during a scan |
+| `SENTINEL_ACTOR` | login name | Who the CLI records in the audit trail (`--actor` overrides it) |
 
 The default URL's credentials are local-development placeholders; set your own in production.
 
@@ -414,8 +573,10 @@ package, smoke-tests the CLI and API against PostgreSQL, and scans the fixture s
 Scanner tests run against two real HTTP servers on `127.0.0.1` (the shop and a vendor CDN on
 another origin) whose pages and scripts the tests change mid-run, plus `httpx.MockTransport`
 for timeouts, oversized bodies, odd redirects and broken servers. No test touches the
-internet. CI also changes a vendor script in the fixture CDN between two scans and checks
-that it is recorded as a new version of the same script.
+internet. CI also authorizes the fixture inventory with policies and approvals, checks
+that the payment-page gate passes, changes a vendor script in the fixture CDN, and checks
+that it is recorded as a new version of the same script, sent back to review, fails the
+gate and leaves an intact audit trail.
 
 ## Project layout
 
@@ -437,6 +598,8 @@ src/script_sentinel/
   sri.py            Subresource Integrity values and browser-style checks
   versions.py       body hashing and per-script version history
   scanner.py        runs a scan and records snapshots, fetches, versions and the inventory
+  authorization.py  decisions, policies and the rules that derive each script's status
+  audit.py          the hash-chained, append-only authorization audit trail
 examples/
   serve.py          serves the fixture shop and its CDN on two local origins
   fixture-site/     synthetic shop for the quick start and CI
