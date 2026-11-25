@@ -7,9 +7,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query, Request, Response, status
 
-from script_sentinel import scanner, versions
+from script_sentinel import findings, scanner, versions
 from script_sentinel.api.schemas import (
     ErrorOut,
+    FindingOut,
     ObservationOut,
     ScanDetail,
     ScanList,
@@ -22,14 +23,14 @@ from script_sentinel.api.schemas import (
     VersionOut,
 )
 from script_sentinel.api.sites import AppSettings, Session
-from script_sentinel.db.models import Scan, ScanTrigger, Script, ScriptVersion
+from script_sentinel.db.models import Finding, Scan, ScanTrigger, Script, ScriptVersion
 
 router = APIRouter(tags=["scans"])
 
 _ERRORS: dict[int | str, dict[str, object]] = {404: {"model": ErrorOut}, 422: {"model": ErrorOut}}
 
 
-def _detail(scan: Scan, site_name: str) -> ScanDetail:
+def _detail(scan: Scan, site_name: str, raised: list[Finding]) -> ScanDetail:
     return ScanDetail(
         **ScanOut.model_validate(scan).model_dump(),
         site=site_name,
@@ -97,6 +98,7 @@ def _detail(scan: Scan, site_name: str) -> ScanDetail:
             )
             for f in scan.script_fetches
         ],
+        findings=[FindingOut.of(f) for f in raised],
     )
 
 
@@ -138,7 +140,7 @@ async def run_scan(
             concurrency=settings.scan_concurrency,
         )
     detailed, site_name = await scanner.get_scan(session, scan.id)
-    return _detail(detailed, site_name)
+    return _detail(detailed, site_name, await findings.scan_findings(session, scan.id))
 
 
 @router.get("/v1/sites/{name}/scans", responses=_ERRORS)
@@ -152,7 +154,7 @@ async def list_scans(
 @router.get("/v1/scans/{scan_id}", responses=_ERRORS)
 async def get_scan(scan_id: uuid.UUID, session: Session) -> ScanDetail:
     scan, site_name = await scanner.get_scan(session, scan_id)
-    return _detail(scan, site_name)
+    return _detail(scan, site_name, await findings.scan_findings(session, scan_id))
 
 
 @router.get("/v1/sites/{name}/scripts", responses=_ERRORS)

@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from script_sentinel import __version__
 from script_sentinel.api import authorization as authorization_api
+from script_sentinel.api import findings as findings_api
 from script_sentinel.api import scans as scans_api
 from script_sentinel.api import sites as sites_api
 from script_sentinel.config import Settings
@@ -79,4 +80,5 @@ def create_app(
     app.include_router(sites_api.router)
     app.include_router(scans_api.router)
     app.include_router(authorization_api.router)
+    app.include_router(findings_api.router)
     return app

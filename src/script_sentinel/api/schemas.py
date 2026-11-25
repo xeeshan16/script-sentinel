@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -14,6 +15,8 @@ from script_sentinel.db.models import (
     AuthorizationStatus,
     ChangePolicy,
     Decision,
+    Finding,
+    FindingStatus,
     Policy,
     PolicyKind,
     ScanStatus,
@@ -22,6 +25,7 @@ from script_sentinel.db.models import (
     ScriptKind,
     ScriptType,
     ScriptVersion,
+    Severity,
     SnapshotOutcome,
     SriStatus,
 )
@@ -119,6 +123,7 @@ class ScanOut(BaseModel):
     scripts_approved: int
     scripts_pending: int
     scripts_rejected: int
+    findings_new: int
 
 
 class ScanList(BaseModel):
@@ -196,6 +201,7 @@ class ScanDetail(ScanOut):
     site: str
     pages: list[SnapshotOut]
     script_fetches: list[ScriptFetchOut]
+    findings: list[FindingOut] = Field(description="Raised by this scan, most severe first.")
 
 
 class VersionOut(BaseModel):
@@ -397,3 +403,108 @@ class ChainOut(BaseModel):
     head_hash: str = Field(description="Hash of the last verified event; keep it elsewhere.")
     first_bad_seq: int | None
     problem: str | None
+
+
+class FindingOut(BaseModel):
+    id: uuid.UUID
+    kind: str = Field(examples=["script.changed", "script.added", "script.reformatted"])
+    severity: Severity
+    status: FindingStatus
+    title: str
+    script_id: uuid.UUID | None
+    locator: str | None
+    version_id: uuid.UUID | None = Field(description="The body that raised it.")
+    previous_version_id: uuid.UUID | None = Field(description="The body served before.")
+    scan_id: uuid.UUID | None
+    created_at: datetime
+    resolved_at: datetime | None
+    status_changed_at: datetime | None
+    status_changed_by: str | None
+    status_note: str | None
+
+    @classmethod
+    def of(cls, finding: Finding) -> FindingOut:
+        return cls(
+            id=finding.id,
+            kind=finding.kind,
+            severity=finding.severity,
+            status=finding.status,
+            title=finding.title,
+            script_id=finding.script_id,
+            locator=finding.locator,
+            version_id=finding.version_id,
+            previous_version_id=finding.previous_version_id,
+            scan_id=finding.scan_id,
+            created_at=finding.created_at,
+            resolved_at=finding.resolved_at,
+            status_changed_at=finding.status_changed_at,
+            status_changed_by=finding.status_changed_by,
+            status_note=finding.status_note,
+        )
+
+
+class FindingDetail(FindingOut):
+    site: str
+    detail: dict[str, Any] = Field(
+        description="The evidence: reasons for the severity, pages, and for a change the "
+        "token diff, size and entropy deltas and newly referenced hosts and URLs."
+    )
+
+
+class FindingList(BaseModel):
+    site: str
+    findings: list[FindingOut]
+
+
+class FindingStatusIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = _ACTOR
+    note: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="What was done or decided. Required to resolve a finding.",
+    )
+
+
+class HunkOut(BaseModel):
+    old_line: int
+    new_line: int
+    removed: str
+    added: str
+    removed_tokens: int
+    added_tokens: int
+    before: str
+    after: str
+    truncated: bool
+
+
+class DeltaOut(BaseModel):
+    old: float
+    new: float
+    delta: float
+
+
+class TokenStatsOut(BaseModel):
+    old: int
+    new: int
+    removed: int
+    added: int
+    similarity: float
+
+
+class DiffOut(BaseModel):
+    script_id: uuid.UUID
+    locator: str
+    from_version: VersionOut
+    to_version: VersionOut
+    size: DeltaOut
+    entropy: DeltaOut
+    tokens: TokenStatsOut
+    hosts_added: list[str]
+    hosts_removed: list[str]
+    urls_added: list[str]
+    urls_removed: list[str]
+    coarse: bool = Field(description="Parts were compared statement by statement.")
+    hunk_count: int
+    hunks: list[HunkOut]

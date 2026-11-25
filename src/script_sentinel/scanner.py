@@ -16,10 +16,14 @@ network:
    against the body the way a browser would.
 
 Policies can change how external scripts are identified: one that drops cache-busting
-query parameters makes ``app.js?v=1`` and ``app.js?v=2`` the same inventory entry. After
+query parameters makes ``app.js?v=1`` and ``app.js?v=2`` the same inventory entry. Inline
+blocks are matched against the page's known inline scripts by content before position
+(:func:`assign_inline_locators`), so inserting a block doesn't shift the others. After
 recording, the status of every script the scan saw is re-evaluated (see
 :mod:`script_sentinel.authorization`); status changes go to the audit trail, and each
-observation keeps the status its script had when the scan finished.
+observation keeps the status its script had when the scan finished. Finally each script
+is compared with what it served last time, and new scripts and changed bodies become
+findings (see :mod:`script_sentinel.findings`).
 """
 
 from __future__ import annotations
@@ -34,12 +38,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from script_sentinel import audit, authorization
+from script_sentinel import audit, authorization, findings
+from script_sentinel.changes import KnownBlock, SeenBlock, match_inline_blocks
 from script_sentinel.db.models import (
     AuthorizationStatus,
     Page,
     PageSnapshot,
-    Policy,
     Scan,
     ScanStatus,
     ScanTrigger,
@@ -78,11 +82,81 @@ class FetchedScript:
     fetched_at: datetime
 
 
-def locator_for(page_url: str, script: ParsedScript, policies: Sequence[Policy] = ()) -> str:
-    if script.src is not None:
-        return authorization.external_locator(script.src, policies)
-    assert script.inline_index is not None
-    return inline_locator(page_url, script.inline_index)
+_INLINE_MARK = "#inline-"
+
+
+async def assign_inline_locators(
+    session: AsyncSession,
+    results: Sequence[PageResult],
+    existing: Mapping[str, Script],
+    digests: Mapping[int, BodyDigest],
+) -> dict[int, str]:
+    """The locator of every inline block in ``results``, keyed by ``id(parsed)``.
+
+    Each page's blocks are matched against the inline scripts already recorded for that
+    page by content before position (see :func:`changes.match_inline_blocks`), so adding a
+    block in front of the others doesn't make every block after it look changed.
+    """
+    page_urls = {
+        result.fetch.final_url or result.url for result in results if result.inventory is not None
+    }
+    known: dict[str, list[tuple[int, Script]]] = {url: [] for url in page_urls}
+    for locator, script in existing.items():
+        if script.kind is not ScriptKind.INLINE:
+            continue
+        page, mark, index = locator.rpartition(_INLINE_MARK)
+        if mark and index.isdigit() and page in known:
+            known[page].append((int(index), script))
+    current = {
+        uuid.UUID(script.current_version_ids[0])
+        for blocks in known.values()
+        for _, script in blocks
+        if script.current_version_ids
+    }
+    bodies: dict[uuid.UUID, tuple[str, str | None, str | None]] = {}
+    ordered = sorted(current)
+    for start in range(0, len(ordered), 500):
+        for row in await session.execute(
+            select(
+                ScriptVersion.id,
+                ScriptVersion.sha384,
+                ScriptVersion.normalized_sha384,
+                ScriptVersion.content,
+            ).where(ScriptVersion.id.in_(ordered[start : start + 500]))
+        ):
+            bodies[row[0]] = (row[1], row[2], row[3])
+
+    def known_block(index: int, script: Script) -> KnownBlock:
+        body = None
+        if script.current_version_ids:
+            body = bodies.get(uuid.UUID(script.current_version_ids[0]))
+        if body is None:
+            return KnownBlock(index, None, None, None)
+        return KnownBlock(index, *body)
+
+    out: dict[int, str] = {}
+    for result in results:
+        if result.inventory is None:
+            continue
+        page_url = result.fetch.final_url or result.url
+        blocks = [p for p in result.inventory.scripts if p.body is not None]
+        if not blocks:
+            continue
+        seen = []
+        for parsed in blocks:
+            assert parsed.inline_index is not None
+            digest = digests[id(parsed)]
+            seen.append(
+                SeenBlock(parsed.inline_index, digest.sha384, digest.normalized_sha384, digest.text)
+            )
+        indexes = await asyncio.to_thread(
+            match_inline_blocks,
+            [known_block(i, script) for i, script in sorted(known[page_url], key=lambda k: k[0])],
+            seen,
+        )
+        for parsed, assigned in zip(blocks, indexes, strict=True):
+            out[id(parsed)] = inline_locator(page_url, assigned)
+    return out
 
 
 async def fetch_pages(
@@ -181,6 +255,9 @@ async def record_scan(
         for parsed in result.inventory.scripts
         if parsed.body is not None
     }
+    inline_locators = await assign_inline_locators(session, results, existing, inline_digests)
+    baseline = await findings.baseline_pages(session, site.id)
+    hosts = await findings.known_hosts(session, site)
     recorder = await VersionRecorder.load(
         session,
         site.id,
@@ -265,9 +342,11 @@ async def record_scan(
         session.add(snapshot)
         if inventory is None:
             continue
-        page_url = fetch.final_url or result.url
         for parsed in inventory.scripts:
-            locator = locator_for(page_url, parsed, policies)
+            if parsed.src is not None:
+                locator = authorization.external_locator(parsed.src, policies)
+            else:
+                locator = inline_locators[id(parsed)]
             script = upsert_script(locator, parsed, result.fetched_at)
             version: ScriptVersion | None = None
             sri_status: SriStatus | None = None
@@ -338,6 +417,19 @@ async def record_scan(
             scan.scripts_fetch_failed += 1
 
     seen_scripts = sorted((existing[locator] for locator in seen), key=lambda s: s.locator)
+    activities = {
+        script.id: findings.ScriptActivity(
+            script=script,
+            previous_ids=list(script.current_version_ids or ()),
+            served_ids=set(served.get(script.id, ())),
+            is_new=script.locator in new,
+        )
+        for script in seen_scripts
+    }
+    for observation in observations:
+        activity = activities[observation.script.id]
+        activity.pages.add(observation.snapshot.url)
+        activity.payment_page = activity.payment_page or observation.snapshot.payment_page
     for script in seen_scripts:
         if script.id in served:
             # A script whose body couldn't be fetched keeps its previous current versions.
@@ -355,6 +447,14 @@ async def record_scan(
     )
     for observation in observations:
         observation.authorization_status = observation.script.status
+    raised = await findings.detect(
+        session,
+        scan,
+        list(activities.values()),
+        baseline=baseline,
+        hosts=hosts,
+        clock=clock,
+    )
 
     scan.scripts_seen = len(seen)
     scan.scripts_new = len(new)
@@ -364,6 +464,7 @@ async def record_scan(
     scan.scripts_approved = statuses.count(AuthorizationStatus.APPROVED)
     scan.scripts_pending = statuses.count(AuthorizationStatus.PENDING)
     scan.scripts_rejected = statuses.count(AuthorizationStatus.REJECTED)
+    scan.findings_new = len(raised)
     scan.finished_at = clock()
     await session.flush()
     return scan

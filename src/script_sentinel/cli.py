@@ -13,7 +13,7 @@ from typing import Annotated, Any
 import typer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from script_sentinel import __version__, audit, authorization, scanner, sites, versions
+from script_sentinel import __version__, audit, authorization, findings, scanner, sites, versions
 from script_sentinel.config import Settings
 from script_sentinel.db import make_engine, make_sessionmaker
 from script_sentinel.db.models import (
@@ -21,6 +21,9 @@ from script_sentinel.db.models import (
     AuthorizationEvent,
     AuthorizationStatus,
     ChangePolicy,
+    Finding,
+    FindingKind,
+    FindingStatus,
     PageSnapshot,
     Policy,
     PolicyKind,
@@ -32,9 +35,12 @@ from script_sentinel.db.models import (
     ScriptKind,
     ScriptObservation,
     ScriptVersion,
+    Severity,
     SnapshotOutcome,
     SriStatus,
 )
+from script_sentinel.diff import Hunk, render_hunks
+from script_sentinel.diff import render as render_diff
 from script_sentinel.fetch import PageFetcher
 from script_sentinel.headers import describe as describe_headers
 
@@ -61,12 +67,20 @@ policies_app = typer.Typer(
 app.add_typer(policies_app, name="policies")
 audit_app = typer.Typer(help="Read and verify the authorization audit trail.", no_args_is_help=True)
 app.add_typer(audit_app, name="audit")
+findings_app = typer.Typer(
+    help="Review what scans noticed: new scripts and changed bodies, with diffs.",
+    no_args_is_help=True,
+)
+app.add_typer(findings_app, name="findings")
 
 # `sentinel scan run` exits with this when any page could not be inventoried...
 EXIT_SCAN_INCOMPLETE = 3
 # ...and with this, under --fail-on-unauthorized, when a payment page runs a script that
-# isn't approved (it wins over EXIT_SCAN_INCOMPLETE).
+# isn't approved (it wins over EXIT_SCAN_INCOMPLETE)...
 EXIT_UNAUTHORIZED = 4
+# ...and with this, under --fail-on SEVERITY, when the scan raised a finding at least that
+# severe (it wins over both).
+EXIT_FINDINGS = 5
 
 DatabaseURL = Annotated[
     str | None,
@@ -358,7 +372,34 @@ _OUTCOME_LABEL = {
 }
 
 
-def _scan_json(scan: Scan, site_name: str) -> dict[str, Any]:
+def _finding_json(finding: Finding, *, detail: bool = False) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "id": str(finding.id),
+        "kind": finding.kind,
+        "severity": finding.severity.value,
+        "status": finding.status.value,
+        "title": finding.title,
+        "locator": finding.locator,
+        "script_id": str(finding.script_id) if finding.script_id else None,
+        "version_id": str(finding.version_id) if finding.version_id else None,
+        "previous_version_id": (
+            str(finding.previous_version_id) if finding.previous_version_id else None
+        ),
+        "scan_id": str(finding.scan_id) if finding.scan_id else None,
+        "reasons": finding.detail.get("reasons", []),
+        "created_at": finding.created_at.isoformat(),
+        "status_changed_at": (
+            finding.status_changed_at.isoformat() if finding.status_changed_at else None
+        ),
+        "status_changed_by": finding.status_changed_by,
+        "status_note": finding.status_note,
+    }
+    if detail:
+        out["detail"] = finding.detail
+    return out
+
+
+def _scan_json(scan: Scan, site_name: str, raised: list[Finding]) -> dict[str, Any]:
     return {
         "id": str(scan.id),
         "site": site_name,
@@ -401,6 +442,7 @@ def _scan_json(scan: Scan, site_name: str) -> dict[str, Any]:
             }
             for f in scan.script_fetches
         ],
+        "findings": [_finding_json(f) for f in raised],
     }
 
 
@@ -447,10 +489,21 @@ _SRI_LABEL = {
 
 @dataclass(frozen=True, slots=True)
 class _Changes:
-    """What a scan saw for the first time (only known right after running it)."""
+    """What a scan noticed: scripts it saw first, and scripts serving a different body."""
 
     new_locators: set[str] = field(default_factory=set)
     changed_scripts: set[uuid.UUID] = field(default_factory=set)
+
+    @classmethod
+    def of(cls, raised: list[Finding], new_locators: set[str] | None = None) -> _Changes:
+        return cls(
+            new_locators if new_locators is not None else set(),
+            {
+                f.script_id
+                for f in raised
+                if f.script_id is not None and f.kind != FindingKind.SCRIPT_ADDED
+            },
+        )
 
 
 def _short(sri: str, width: int = 22) -> str:
@@ -481,6 +534,33 @@ def _observation_line(
         extras.append(f"not fetched: {failed[obs.script_id]}")
     body = f"  {_short(obs.version.sri)}" if obs.version else ""
     return f"      {marker} {obs.script.locator}  ({', '.join(extras)}){body}"
+
+
+_SEVERITY_COLOR = {
+    Severity.INFO: None,
+    Severity.LOW: None,
+    Severity.MEDIUM: typer.colors.YELLOW,
+    Severity.HIGH: typer.colors.RED,
+    Severity.CRITICAL: typer.colors.RED,
+}
+
+
+def _finding_line(finding: Finding, *, with_id: bool = False) -> None:
+    ident = f"{finding.id}  " if with_id else ""
+    typer.secho(
+        f"  {finding.severity.value.upper():<8} {ident}{finding.title}",
+        fg=_SEVERITY_COLOR[finding.severity],
+        bold=finding.severity is Severity.CRITICAL,
+    )
+    typer.echo(f"           {'; '.join(finding.detail.get('reasons', []))}")
+
+
+def _print_findings(raised: list[Finding]) -> None:
+    if not raised:
+        return
+    typer.echo(f"findings: {len(raised)} (review with: sentinel findings show ID)")
+    for finding in raised:
+        _finding_line(finding, with_id=True)
 
 
 def _print_scan(scan: Scan, site_name: str, changes: _Changes) -> None:
@@ -586,20 +666,28 @@ def scan_run(
             help="Exit 4 when a payment page runs a script that isn't approved.",
         ),
     ] = False,
+    fail_on: Annotated[
+        Severity | None,
+        typer.Option(
+            "--fail-on",
+            help="Exit 5 when the scan raises a finding at least this severe.",
+            case_sensitive=False,
+        ),
+    ] = None,
     as_json: JsonOutput = False,
     url: DatabaseURL = None,
 ) -> None:
     """Fetch every page of SITE now, record its scripts and print what was found.
 
-    Exits 3 when any page could not be inventoried, and 4 with --fail-on-unauthorized when
-    a payment page runs a script that isn't approved.
+    Exits 3 when any page could not be inventoried, 4 with --fail-on-unauthorized when a
+    payment page runs a script that isn't approved, and 5 with --fail-on SEVERITY when the
+    scan raised a finding at least that severe (5 wins over 4, and 4 over 3).
     """
     settings = Settings()
 
-    async def work(session: AsyncSession) -> tuple[Scan, str, _Changes]:
+    async def work(session: AsyncSession) -> tuple[Scan, str, list[Finding], _Changes]:
         known = await scanner.list_scripts(session, site)
         before = {s.locator for s in known}
-        known_versions = await versions.versions_by_script(session, [s.id for s in known])
         async with PageFetcher(settings.fetch_limits()) as fetcher:
             scan = await scanner.scan_site(
                 session,
@@ -610,21 +698,17 @@ def scan_run(
             )
         detailed, name = await scanner.get_scan(session, scan.id)
         after = {s.locator for s in await scanner.list_scripts(session, site)}
-        changed = {
-            obs.script_id
-            for snap in detailed.snapshots
-            for obs in snap.observations
-            if obs.version_id is not None
-            and known_versions.get(obs.script_id)
-            and obs.version_id not in {v.id for v in known_versions[obs.script_id]}
-        }
-        return detailed, name, _Changes(after - before, changed)
+        raised = await findings.scan_findings(session, scan.id)
+        return detailed, name, raised, _Changes.of(raised, after - before)
 
-    scan, name, changes = _run(url, work)
+    scan, name, raised, changes = _run(url, work)
     if as_json:
-        typer.echo(json.dumps(_scan_json(scan, name), indent=2))
+        typer.echo(json.dumps(_scan_json(scan, name, raised), indent=2))
     else:
         _print_scan(scan, name, changes)
+        _print_findings(raised)
+    if fail_on is not None and findings.any_at_least(raised, fail_on):
+        raise typer.Exit(code=EXIT_FINDINGS)
     if fail_on_unauthorized and _unauthorized_on_payment_pages(scan):
         raise typer.Exit(code=EXIT_UNAUTHORIZED)
     if scan.status is not ScanStatus.COMPLETED:
@@ -689,14 +773,16 @@ def scan_show(
         typer.secho(f"error: {scan_id!r} is not a scan id", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from None
 
-    async def work(session: AsyncSession) -> tuple[Scan, str]:
-        return await scanner.get_scan(session, parsed)
+    async def work(session: AsyncSession) -> tuple[Scan, str, list[Finding]]:
+        scan, name = await scanner.get_scan(session, parsed)
+        return scan, name, await findings.scan_findings(session, parsed)
 
-    scan, name = _run(url, work)
+    scan, name, raised = _run(url, work)
     if as_json:
-        typer.echo(json.dumps(_scan_json(scan, name), indent=2))
+        typer.echo(json.dumps(_scan_json(scan, name, raised), indent=2))
     else:
-        _print_scan(scan, name, _Changes())
+        _print_scan(scan, name, _Changes.of(raised))
+        _print_findings(raised)
 
 
 def _version_json(version: ScriptVersion) -> dict[str, Any]:
@@ -814,6 +900,82 @@ def scripts_show(
 
 
 Locator = Annotated[str, typer.Argument(help="The script's src URL, or PAGE#inline-N.")]
+
+
+def _print_analysis(detail: dict[str, Any], hunks_text: str) -> None:
+    size, ent, tokens = detail["size"], detail["entropy"], detail["tokens"]
+    entropy_delta = round(ent["delta"], 2) or 0.0  # never "-0.00"
+    typer.echo(
+        f"  size: {size['old']} -> {size['new']} bytes ({size['delta']:+d})   "
+        f"entropy: {ent['old']:.2f} -> {ent['new']:.2f} bits/char ({entropy_delta:+.2f})"
+    )
+    typer.echo(
+        f"  tokens: -{tokens['removed']} +{tokens['added']} of {tokens['old']} -> "
+        f"{tokens['new']} (similarity {tokens['similarity']:.0%})"
+        + ("  [coarse: parts compared whole]" if detail.get("coarse") else "")
+    )
+    for label, key in (
+        ("new hosts", "hosts_added"),
+        ("hosts no longer referenced", "hosts_removed"),
+        ("new URLs", "urls_added"),
+    ):
+        if detail.get(key):
+            typer.echo(f"  {label}: {', '.join(detail[key][:10])}")
+    if hunks_text:
+        typer.echo(hunks_text)
+
+
+@scripts_app.command("diff")
+def scripts_diff(
+    site: str,
+    locator: Locator,
+    from_ref: Annotated[
+        str | None,
+        typer.Option(
+            "--from", help="Version id, or a SHA-384 or SRI prefix. Default: the one before."
+        ),
+    ] = None,
+    to_ref: Annotated[
+        str | None,
+        typer.Option("--to", help="Version id, or a SHA-384 or SRI prefix. Default: the latest."),
+    ] = None,
+    max_hunks: Annotated[int, typer.Option(min=1, help="Hunks to print.")] = 20,
+    as_json: JsonOutput = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Show the token diff between two versions of a script.
+
+    Comments and whitespace are ignored, so a minified one-line bundle diffs down to the
+    tokens that changed.
+    """
+
+    async def work(session: AsyncSession) -> versions.VersionDiff:
+        script = await versions.find_script(session, site, locator)
+        return await versions.diff_versions(
+            session, site, script.id, from_ref=from_ref, to_ref=to_ref
+        )
+
+    result = _run(url, work)
+    detail = result.analysis.to_dict(max_hunks=max_hunks)
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "locator": result.script.locator,
+                    "from": _version_json(result.old),
+                    "to": _version_json(result.new),
+                    **detail,
+                },
+                indent=2,
+            )
+        )
+        return
+    typer.echo(result.script.locator)
+    typer.echo(f"  from {result.old.sri}  (first seen {result.old.first_seen_at:%Y-%m-%d %H:%M}Z)")
+    typer.echo(f"  to   {result.new.sri}  (first seen {result.new.first_seen_at:%Y-%m-%d %H:%M}Z)")
+    if result.analysis.diff.identical:
+        typer.echo("  same code: only comments or whitespace differ")
+    _print_analysis(detail, render_diff(result.analysis.diff, max_hunks=max_hunks))
 
 
 def _decision(
@@ -1153,3 +1315,142 @@ def audit_verify(site: str, as_json: JsonOutput = False, url: DatabaseURL = None
         )
     if not report.ok:
         raise typer.Exit(code=1)
+
+
+def _finding_id(value: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        typer.secho(f"error: {value!r} is not a finding id", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from None
+
+
+@findings_app.command("list")
+def findings_list(
+    site: str,
+    status: Annotated[
+        FindingStatus | None,
+        typer.Option(help="Only findings with this status.", case_sensitive=False),
+    ] = None,
+    min_severity: Annotated[
+        Severity | None,
+        typer.Option("--min-severity", help="Only this severe or worse.", case_sensitive=False),
+    ] = None,
+    locator: Annotated[
+        str | None, typer.Option("--script", help="Only findings about this script.")
+    ] = None,
+    limit: Annotated[int, typer.Option(min=1, max=500, help="How many findings.")] = 50,
+    as_json: JsonOutput = False,
+    url: DatabaseURL = None,
+) -> None:
+    """List a site's findings, newest first."""
+
+    async def work(session: AsyncSession) -> list[Finding]:
+        script_id = (await versions.find_script(session, site, locator)).id if locator else None
+        return await findings.list_findings(
+            session,
+            site,
+            status=status,
+            min_severity=min_severity,
+            script_id=script_id,
+            limit=limit,
+        )
+
+    rows = _run(url, work)
+    if as_json:
+        typer.echo(json.dumps([_finding_json(f) for f in rows], indent=2))
+        return
+    if not rows:
+        typer.echo(f"no findings for {site}")
+        return
+    for finding in rows:
+        typer.echo(
+            f"{finding.created_at:%Y-%m-%d %H:%M:%S}Z  {finding.status.value:<12} {finding.id}"
+        )
+        _finding_line(finding)
+
+
+@findings_app.command("show")
+def findings_show(
+    finding_id: Annotated[str, typer.Argument(metavar="FINDING_ID")],
+    max_hunks: Annotated[int, typer.Option(min=1, help="Hunks to print.")] = 20,
+    as_json: JsonOutput = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Show a finding with its evidence: for a change, the diff and what it references."""
+    parsed = _finding_id(finding_id)
+
+    async def work(session: AsyncSession) -> tuple[Finding, str]:
+        return await findings.get_finding(session, parsed)
+
+    finding, site = _run(url, work)
+    if as_json:
+        typer.echo(json.dumps({**_finding_json(finding, detail=True), "site": site}, indent=2))
+        return
+    detail = finding.detail
+    typer.echo(f"finding {finding.id} ({site}): {finding.kind}, {finding.status.value}")
+    _finding_line(finding)
+    flag = " [payment]" if detail.get("payment_page") else ""
+    typer.echo(f"  pages{flag}: {', '.join(detail.get('pages', []))}")
+    if finding.status_changed_by:
+        typer.echo(
+            f"  {finding.status.value} by {finding.status_changed_by}"
+            + (f": {finding.status_note}" if finding.status_note else "")
+        )
+    if "tokens" in detail:
+        hunks = [Hunk.from_dict(h) for h in detail.get("hunks") or []]
+        text = render_hunks(hunks, max_hunks=max_hunks, total=detail.get("hunk_count"))
+        _print_analysis(detail, text)
+    elif detail.get("hosts_referenced"):
+        typer.echo(f"  hosts referenced: {', '.join(detail['hosts_referenced'][:10])}")
+
+
+def _set_finding(
+    finding_id: str, status: FindingStatus, note: str | None, actor: str | None, url: str | None
+) -> None:
+    parsed = _finding_id(finding_id)
+
+    async def work(session: AsyncSession) -> Finding:
+        finding, _ = await findings.set_status(
+            session, parsed, status, actor=_actor(actor), note=note
+        )
+        return finding
+
+    finding = _run(url, work)
+    typer.echo(f"finding {finding.id} is now {finding.status.value}")
+
+
+Note = Annotated[str | None, typer.Option("--note", "-n", help="What was done or decided.")]
+
+
+@findings_app.command("ack")
+def findings_ack(
+    finding_id: Annotated[str, typer.Argument(metavar="FINDING_ID")],
+    note: Note = None,
+    actor: Actor = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Acknowledge a finding (someone is on it). Recorded in the audit trail."""
+    _set_finding(finding_id, FindingStatus.ACKNOWLEDGED, note, actor, url)
+
+
+@findings_app.command("resolve")
+def findings_resolve(
+    finding_id: Annotated[str, typer.Argument(metavar="FINDING_ID")],
+    note: Note = None,
+    actor: Actor = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Resolve a finding; --note saying what was done is required. Audited."""
+    _set_finding(finding_id, FindingStatus.RESOLVED, note, actor, url)
+
+
+@findings_app.command("reopen")
+def findings_reopen(
+    finding_id: Annotated[str, typer.Argument(metavar="FINDING_ID")],
+    note: Note = None,
+    actor: Actor = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Reopen an acknowledged or resolved finding. Audited."""
+    _set_finding(finding_id, FindingStatus.OPEN, note, actor, url)

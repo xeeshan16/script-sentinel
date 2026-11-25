@@ -72,7 +72,7 @@ def test_upgrade_and_downgrade_round_trip(database_url: str) -> None:
 
 def test_current_prints_the_revision(sqlite_url: str, capsys: pytest.CaptureFixture[str]) -> None:
     migrate.current(sqlite_url)
-    assert "0004" in capsys.readouterr().out
+    assert "0005" in capsys.readouterr().out
 
 
 def _counts(database_url: str) -> dict[str, int]:
@@ -142,3 +142,47 @@ def test_0004_keeps_existing_data_both_ways(
     assert _counts(database_url) == {**before, "script_fetches": 1}
     migrate.upgrade(database_url)
     assert _counts(database_url) == {**before, "script_fetches": 1}
+
+
+def test_0005_keeps_findings_both_ways(
+    database_url: str, fixture_site: FixtureSite, cdn: FixtureSite
+) -> None:
+    """Rebuilding `findings` on SQLite keeps its rows; `scans` is never rebuilt."""
+    cdn.set("/tag.js", "tag(1);", content_type="text/javascript")
+    fixture_site.page("/", f'<script src="{cdn.url("/tag.js")}"></script>')
+
+    async def scan_twice() -> None:
+        engine = make_engine(database_url)
+        try:
+            async with make_sessionmaker(engine)() as session, session.begin():
+                await sites.create_site(
+                    session,
+                    name="shop",
+                    allowed_origins=[fixture_site.origin],
+                    scan_interval_hours=24,
+                )
+                await sites.add_page(session, "shop", url=fixture_site.url("/"))
+                async with PageFetcher() as fetcher:
+                    await scanner.scan_site(session, "shop", fetcher, trigger=ScanTrigger.CLI)
+                    cdn.set("/tag.js", "tag(2);", content_type="text/javascript")
+                    await scanner.scan_site(session, "shop", fetcher, trigger=ScanTrigger.CLI)
+        finally:
+            await engine.dispose()
+
+    async def count(sql: str) -> int:
+        engine = make_engine(database_url)
+        try:
+            async with engine.connect() as conn:
+                return int((await conn.execute(text(sql))).scalar_one())
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scan_twice())
+    before = _counts(database_url)
+    assert asyncio.run(count("SELECT count(*) FROM findings")) == 1
+    migrate.downgrade(database_url, "0004")
+    assert asyncio.run(count("SELECT count(*) FROM findings")) == 1
+    assert asyncio.run(count("SELECT count(*) FROM scans")) == 2
+    migrate.upgrade(database_url)
+    assert asyncio.run(count("SELECT count(*) FROM findings")) == 1
+    assert _counts(database_url) == before

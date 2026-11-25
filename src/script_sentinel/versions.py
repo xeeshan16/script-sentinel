@@ -3,12 +3,13 @@
 Every body a script serves becomes a :class:`ScriptVersion`, identified within its script
 by the SHA-384 of the exact bytes. Seeing the same body again only moves its
 ``last_seen_at``; a body never seen before is a new version, and a new version of a script
-that already had one is a *change*. Changes are what the policy engine (day 4) and the diff
-and heuristics (days 5 and 6) look at.
+that already had one is a *change*. Changes are what the policy engine and the findings
+(:mod:`script_sentinel.findings`) look at; :func:`diff_versions` compares any two versions.
 """
 
 from __future__ import annotations
 
+import asyncio
 import codecs
 import hashlib
 import uuid
@@ -20,9 +21,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
+from script_sentinel.changes import ChangeAnalysis, analyze_change
 from script_sentinel.db.models import Script, ScriptVersion
 from script_sentinel.jstokens import normalized_sha384
-from script_sentinel.sites import NotFoundError, get_site
+from script_sentinel.sites import NotFoundError, ValidationError, get_site
 from script_sentinel.sri import body_digests
 
 
@@ -235,3 +237,84 @@ async def get_version(
     if version is None:
         raise NotFoundError(f"version {version_id} of script {script_id} not found")
     return version
+
+
+async def resolve_version(session: AsyncSession, script: Script, ref: str) -> ScriptVersion:
+    """A version of ``script`` (without its body) by id, by a prefix of its hex SHA-384, or
+    by a prefix of its SRI value (``sha384-…``, as ``sentinel scripts show`` prints it).
+
+    Prefixes need at least 8 characters after any ``sha384-``.
+    """
+    ref = ref.strip()
+    versions = (await versions_by_script(session, [script.id]))[script.id]
+    try:
+        wanted = uuid.UUID(ref)
+    except ValueError:
+        wanted = None
+    if wanted is not None:
+        matches = [v for v in versions if v.id == wanted]
+    elif ref.startswith("sha384-") and len(ref) >= 15:
+        matches = [v for v in versions if v.sri.startswith(ref)]
+    elif len(ref) >= 8 and all(c in "0123456789abcdef" for c in ref.lower()):
+        matches = [v for v in versions if v.sha384.startswith(ref.lower())]
+    else:
+        raise ValidationError(
+            f"{ref!r} is not a version id, a SHA-384 prefix (8+ hex) or an SRI prefix "
+            "(sha384- and 8+ characters)"
+        )
+    if not matches:
+        raise NotFoundError(f"no version {ref!r} of script {script.locator!r}")
+    if len(matches) > 1:
+        raise ValidationError(f"{ref!r} matches {len(matches)} versions; give more characters")
+    return matches[0]
+
+
+@dataclass(frozen=True, slots=True)
+class VersionDiff:
+    script: Script
+    old: ScriptVersion
+    new: ScriptVersion
+    analysis: ChangeAnalysis
+
+
+async def diff_versions(
+    session: AsyncSession,
+    site_name: str,
+    script_id: uuid.UUID,
+    *,
+    from_ref: str | None = None,
+    to_ref: str | None = None,
+) -> VersionDiff:
+    """Compare two versions of a script (see :func:`resolve_version` for ``*_ref``).
+
+    By default ``to`` is the body seen most recently and ``from`` the one seen before it.
+    """
+    script = await get_script(session, site_name, script_id)
+    history = (await versions_by_script(session, [script.id]))[script.id]
+    if to_ref is not None:
+        new = await resolve_version(session, script, to_ref)
+    elif history:
+        new = history[0]
+    else:
+        raise ValidationError(f"script {script.locator!r} has no versions yet")
+    if from_ref is not None:
+        old = await resolve_version(session, script, from_ref)
+    else:
+        older = [v for v in history if v.id != new.id]
+        if not older:
+            raise ValidationError(f"script {script.locator!r} has only one version")
+        old = older[0]
+    rows = await session.execute(
+        select(ScriptVersion.id, ScriptVersion.content).where(
+            ScriptVersion.id.in_([old.id, new.id])
+        )
+    )
+    texts = {row[0]: row[1] for row in rows}
+    analysis = await asyncio.to_thread(
+        analyze_change,
+        texts.get(old.id) or "",
+        texts.get(new.id) or "",
+        old_size=old.size_bytes,
+        new_size=new.size_bytes,
+    )
+    return VersionDiff(script, old, new, analysis)

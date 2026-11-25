@@ -27,7 +27,7 @@ def test_version() -> None:
 def test_db_commands(tmp_path: Path) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path / 'cli.db'}"
     assert _invoke("db", "upgrade", "--url", url) == (0, "database upgraded to head\n")
-    assert _invoke("db", "current", "--url", url) == (0, "0004 (head)\n")
+    assert _invoke("db", "current", "--url", url) == (0, "0005 (head)\n")
     assert _invoke("db", "downgrade", "base", "--url", url) == (
         0,
         "database downgraded to base\n",
@@ -173,6 +173,8 @@ def test_scan_run_list_show_and_scripts(sqlite_url: str, fixture_site: FixtureSi
         "authorization: 0 approved, 2 pending, 0 rejected",
         "bodies: 1 external fetched, 0 failed; 1 new versions, 0 scripts changed",
     ]
+    # The checkout page was never inventoried before (robots.txt), so this scan is its
+    # baseline: its scripts are recorded, not reported as findings.
     assert "1 script tags fail their integrity check" in result.stderr
     assert "payment pages run 2 scripts that are not approved" in result.stderr
 
@@ -195,7 +197,13 @@ def test_scan_run_list_show_and_scripts(sqlite_url: str, fixture_site: FixtureSi
     scan_id = listed[0]["id"]
     code, out = _invoke("scan", "show", scan_id, *url)
     assert code == 0
-    assert not [line for line in out.splitlines() if line.startswith(("      +", "      ~"))]
+    # `scan show` marks the scripts the scan's findings are about, not new scripts.
+    marked = [line for line in out.splitlines() if line.startswith(("      +", "      ~"))]
+    assert marked == [f"      ~ {line.split('~ ')[1]}" for line in marked]
+    assert len(marked) == 2  # app.js on both pages
+    assert "MEDIUM   " in out
+    assert f"Script changed: {origin}/app.js" in out
+    assert "the code changed; runs on a payment page" in out
     shown = json.loads(_invoke("scan", "show", scan_id, "--json", *url)[1])
     assert shown["id"] == scan_id
     assert shown["status"] == "completed"

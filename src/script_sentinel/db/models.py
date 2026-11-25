@@ -14,8 +14,9 @@
   cache-busting query parameters from the locator.
 * An **authorization event** is one entry of a site's append-only, hash-chained audit trail:
   a decision, a policy change, or a script's status changing after a scan.
-* A **finding** is something a person should look at: an unapproved script, a changed
-  body, a suspicious pattern.
+* A **finding** is something a scan noticed that a person should look at: a script that
+  appeared, or one that serves a different body than last time, with the diff and a
+  severity.
 * A **script fetch** is one download of an external script during a scan: what came back
   and which version it was.
 * A **scan** is one pass over a site's pages. Each page it fetched gets a **page
@@ -124,6 +125,13 @@ class Severity(enum.StrEnum):
     MEDIUM = "medium"
     HIGH = "high"
     CRITICAL = "critical"
+
+
+class FindingKind(enum.StrEnum):
+    SCRIPT_ADDED = "script.added"  # a script that appeared after the site's first scan
+    SCRIPT_CHANGED = "script.changed"  # a script serving a body it didn't serve last time
+    # A new body whose normalized form (comments and whitespace aside) is unchanged.
+    SCRIPT_REFORMATTED = "script.reformatted"
 
 
 class FindingStatus(enum.StrEnum):
@@ -331,8 +339,18 @@ class ScriptVersion(Base):
 
 
 class Finding(Base):
+    """Something a scan noticed that a person should look at.
+
+    ``detail`` holds the evidence: for a change, the token diff, size and entropy deltas
+    and the hosts and URLs the new body references that the old one didn't. ``locator``
+    keeps the finding readable after its script is deleted (``script_id`` becomes NULL).
+    """
+
     __tablename__ = "findings"
-    __table_args__ = (Index("ix_findings_site_status", "site_id", "status"),)
+    __table_args__ = (
+        Index("ix_findings_site_status", "site_id", "status"),
+        Index("ix_findings_scan_id", "scan_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     site_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"))
@@ -342,6 +360,12 @@ class Finding(Base):
     version_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("script_versions.id", ondelete="SET NULL")
     )
+    # The body the script served before a change (NULL for a new script).
+    previous_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("script_versions.id", ondelete="SET NULL")
+    )
+    scan_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("scans.id", ondelete="SET NULL"))
+    locator: Mapped[str | None] = mapped_column(String(2048))
     kind: Mapped[str] = mapped_column(String(64))
     severity: Mapped[Severity] = mapped_column(_enum(Severity, "severity"))
     status: Mapped[FindingStatus] = mapped_column(
@@ -351,6 +375,10 @@ class Finding(Base):
     detail: Mapped[dict[str, Any]] = mapped_column(default=dict)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     resolved_at: Mapped[datetime | None]
+    # Who last acknowledged, resolved or reopened the finding, when, and why.
+    status_changed_at: Mapped[datetime | None]
+    status_changed_by: Mapped[str | None] = mapped_column(String(128))
+    status_note: Mapped[str | None] = mapped_column(Text)
 
 
 class Scan(Base):
@@ -380,6 +408,8 @@ class Scan(Base):
     scripts_approved: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     scripts_pending: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     scripts_rejected: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Findings this scan raised (new scripts, changed bodies).
+    findings_new: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     snapshots: Mapped[list[PageSnapshot]] = relationship(
         back_populates="scan",
