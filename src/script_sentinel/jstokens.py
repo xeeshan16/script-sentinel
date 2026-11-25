@@ -16,11 +16,11 @@ Line breaks are kept because automatic semicolon insertion makes them meaningful
 hash, which errs on the side of reporting a change.
 
 The tokenizer follows the ECMAScript lexical grammar closely enough for that purpose, and is
-also the basis for the token-level diff (day 5). It never raises: unterminated strings,
-comments, template literals or regular expressions end at the end of the input and mark the
-result as incomplete. The ``/`` ambiguity (division or the start of a regular expression)
-is resolved from the previous significant token, the standard approach for tokenizers that
-don't parse.
+also the basis for the token-level diff (:mod:`script_sentinel.diff`). It never raises:
+unterminated strings, comments, template literals or regular expressions end at the end of
+the input and mark the result as incomplete. The ``/`` ambiguity (division or the start of
+a regular expression) is resolved from the previous significant token, the standard
+approach for tokenizers that don't parse.
 """
 
 from __future__ import annotations
