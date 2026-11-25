@@ -330,3 +330,106 @@ that are expected to change (with cache-busting query normalization).
 versions, size and entropy deltas, newly referenced domains and URLs, and findings with a
 severity. Also match inline blocks by content before position, so inserting one doesn't
 make the ones after it look changed.
+
+## Day 5 — 2026-11-25: change detection and diff
+
+**Done**
+
+- `diff.py`: a token diff between two script bodies, on the tokens from `jstokens`, so
+  comments and whitespace never count and an edit inside a minified one-line bundle comes
+  out as the few tokens that changed, with context and line numbers.
+  - The common prefix and suffix are trimmed first; small middles go to
+    `difflib.SequenceMatcher` (autojunk off: in JavaScript the most frequent tokens are the
+    ones it would ignore).
+  - Large middles get a patience diff: tokens that occur once on each side anchor the
+    alignment (longest increasing run), recursively, and ranges without unique tokens use
+    `SequenceMatcher` while a total work budget lasts. Past the budget a range is reported
+    whole and the diff is marked `coarse` (only if the two sides share tokens; a
+    replacement with nothing in common is exact).
+  - Found while measuring: the first version compared statement-sized chunks instead, and
+    a shuffled 1.4 MB synthetic bundle (90,000 chunks, "}" in a third of them) didn't
+    finish within 100 s. With the patience diff the same input takes about 2.4 s here, and
+    a realistic two-edit change to that bundle about 2 s for the whole analysis. Each body
+    is tokenized once for both the diff and the URL extraction.
+- `changes.py`: what a change means.
+  - Size and Shannon entropy (bits per character) before and after; the entropy rule only
+    counts for bodies of at least 1 KiB, because a few hundred characters swing with any
+    edit.
+  - URLs and hosts referenced in string and template literals, with `\/`, `\xNN` and
+    `\uNNNN`/`\u{…}` escapes undone, protocol-relative `//host` included, and template
+    substitutions cut out. Hosts are kept in full, URLs capped at 200 per body.
+  - Severity rules as pure functions: reformatting only is `info`; a code change is
+    `low`; sharp growth (> 50% and ≥ 1 KiB) or an entropy jump (> 0.3 bits) is `medium`;
+    a newly referenced host is `high`; a payment page raises one level. Going back to an
+    earlier body is `low`. A new script is `low` inline, `medium` external, `high` from a
+    host no other script of the site uses, one level up on a payment page.
+  - Inline block matching: exact body, then normalized body, then token similarity
+    (≥ 0.6, best pairs first), then position, then a fresh index. Similarity is skipped
+    past 50 × 50 candidate pairs.
+- `findings.py` and the scanner:
+  - After each scan, every script is compared with the bodies it served on its last
+    successful fetch (`current_version_ids` before the scan). Any body outside that set
+    raises `script.changed` (or `script.reformatted`), diffed against the closest previous
+    body; this also fixes day 3's gap where going back to an earlier body wasn't counted.
+    A failed fetch raises nothing and keeps the old bodies as the reference.
+  - A script new to the inventory raises `script.added` only if it shows up on a page an
+    earlier scan already inventoried. First version: "after the site's first scan". The
+    CI smoke test showed why that's wrong: the checkout page had been skipped by robots.txt
+    until then, so all of its scripts became findings the first time it was scanned. Now
+    each page's first successful scan is its baseline.
+  - Inline locators come from the matching above instead of the raw position, fixing day
+    2's known limitation: a snippet inserted in front makes one new script, not N changes.
+    Inventories from before day 4 have inline scripts without current bodies; those fall
+    back to positions (tested).
+  - Findings can be acknowledged, resolved (a note is required) and reopened; each step
+    records who, when and why on the finding and appends `finding.*` events to the site's
+    hash-chained audit trail.
+- Migration `0005`: `findings.scan_id`, `previous_version_id`, `locator` (so a finding stays
+  readable after its script is deleted), `status_changed_at/by`, `status_note`, an index on
+  `scan_id`, and `scans.findings_new`. `findings` is rebuilt on SQLite (nothing references
+  it); `scans` only gets an `ADD COLUMN`.
+- API: scan responses carry `findings_new` and the findings; `GET /v1/sites/{name}/findings`
+  (filters: status, minimum severity, scan, script), `GET /v1/findings/{id}`,
+  `POST /v1/findings/{id}/acknowledge|resolve|reopen`, and
+  `GET /v1/sites/{name}/scripts/{id}/diff?from=&to=` (version id, hex SHA-384 prefix or the
+  SRI prefix that `scripts show` prints).
+- CLI: `scan run` and `scan show` list the findings (and `~` now marks the scripts a change
+  finding is about); `scan run --fail-on SEVERITY` exits 5 (it wins over 4 and 3);
+  `sentinel findings list|show|ack|resolve|reopen`; `sentinel scripts diff SITE LOCATOR
+  [--from] [--to]`.
+- CI: the fixture smoke test now also checks the analytics change is a `medium` finding,
+  plants a synthetic skimmer (a `sendBeacon` to a new host) and checks for a `critical`
+  finding with the host and the added tokens, exit 5 from `--fail-on high`, the scripts
+  diff, the audited ack/resolve flow (resolve without a note exits 2), and that inserting
+  an inline block in front raises exactly one `script.added` for `#inline-3`.
+
+**Tests**
+
+- 430 tests locally on Python 3.13 against SQLite and PostgreSQL 16 (72 new), 100% line
+  and branch coverage; the suite also passes on Python 3.12 (SQLite). Ruff and mypy (strict)
+  are clean.
+- New: `test_diff.py` (hunks, lines across every line terminator, truncation, the patience
+  path against the exact result, the budget and `coarse`), `test_changes.py` (references,
+  entropy, every severity rule, inline matching cases), `test_findings.py` (real scans
+  against the two local servers: vendor change with a new host, reformatting, reverting,
+  failed fetches, added scripts and hosts, per-page baselines, inline insertion and
+  in-place edits, a script serving two bodies, the handling workflow and its audit events,
+  findings outliving their script, version diffs), API and CLI tests, and a migration test
+  that `0005` keeps findings in both directions.
+- Both CI smoke scripts were run locally against PostgreSQL 16 before pushing, and the
+  README output comes from a real run.
+
+**Known limitations (deliberate for now)**
+
+- Line breaks don't count in the token diff (they do in the normalized hash), so a change
+  that only matters through automatic semicolon insertion shows up as a hash change with
+  an empty diff.
+- URLs assembled at runtime (`"https://" + host`, `atob(...)`) aren't extracted; that is
+  day 6's skimmer heuristics.
+- A finding's diff keeps the first 50 hunks; `scripts diff` recomputes the full diff on
+  demand.
+
+**Next (day 6):** skimmer heuristics. New exfiltration sinks (fetch, XHR, sendBeacon, image
+or WebSocket to a new host), listeners on card or form fields, wallet-address regexes and
+swaps, eval/atob/obfuscation and scripts that inject other scripts, against a corpus of
+synthetic malicious fixtures, feeding the finding's severity.
