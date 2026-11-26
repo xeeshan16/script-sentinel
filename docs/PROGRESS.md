@@ -433,3 +433,99 @@ make the ones after it look changed.
 or WebSocket to a new host), listeners on card or form fields, wallet-address regexes and
 swaps, eval/atob/obfuscation and scripts that inject other scripts, against a corpus of
 synthetic malicious fixtures, feeding the finding's severity.
+
+## Day 6 — 2026-11-26: skimmer heuristics
+
+**Done**
+
+- `heuristics.py`: reads what a body *does*, in two steps.
+  - `inspect()` partly evaluates the token stream first, the way a reviewer reads
+    obfuscated code: `atob("…")`, `String.fromCharCode(…)` and
+    `"…".split("").reverse().join("")` on literals are replaced by their result (three
+    layers deep), adjacent literals joined with `+` are folded, `obj["name"]` becomes
+    `obj.name`, escaped identifiers (`e\u0076al`) are read as what they spell, and
+    `name = <URL>` assignments are remembered so `fetch(name)` knows its destination.
+  - The rules then emit counted signals with evidence (the code where each first occurs):
+    exfiltration sinks (`sendBeacon`, `fetch`, XHR via `.open`, image pixels via `.src` or
+    `setAttribute`, WebSockets, `$.ajax`/`$.post`/`$.get`) with their destination
+    (literal, hidden, relative or computed at runtime); card fields in strings, selectors
+    and property names; form listeners (`addEventListener`, jQuery `.on`, `onX =`) and
+    serialization; cookies and storage; wallet addresses (ETH, bech32, base58, TRON),
+    address-matching regexes and `RegExp` strings, clipboard access; `eval`/`Function`
+    (separately on decoded text), string timers, the packer, `_0x` names, sensitive text
+    hidden by encoding or joining, sensitive APIs reached by hidden names; scripts injected
+    with `createElement("script")`, `<script>` markup or `import()`, with their source.
+  - `assess()` combines signals into verdicts with a severity: card fields plus a send to a
+    host that is neither the script's nor the site's (or a hidden one) is `high`, `medium`
+    when the destination is computed at runtime; form input plus such a send is `high`; a
+    send to a hidden host is `high`; wallet addresses with the clipboard, or an address with
+    a matcher, is `high`; `eval` on decoded text is `high`; dynamic code, packing, hidden
+    URLs and injected scripts from other hosts are `medium`; a send to another host with
+    nothing else is `low`. With the previous body's report, a verdict needs at least one
+    signal that is new or occurs more often.
+- Wired into change review:
+  - `analyze_change` runs both bodies through the heuristics. Hosts the code hides count
+    as referenced hosts, which closes day 5's limitation on URLs built with `atob` or
+    joined from pieces. The analysis carries the signals the new body added and the
+    verdicts on them, and each verdict raises the severity (before the payment-page step).
+    Going back to an earlier body skips the new-host rule but not the heuristics: the old
+    body may be the skimmer coming back.
+  - New scripts get every signal and verdict in their finding and the severity of the worst
+    verdict.
+  - New `script.suspicious` finding kind: a script on a page's first scan with a `high`
+    verdict or worse is reported instead of becoming part of the baseline. Medium verdicts
+    stay in the baseline. No migration: `findings.kind` is a free `VARCHAR(64)`.
+  - "Its own" destinations are the script's host and the site's origin hosts (ports
+    ignored), passed by the scanner.
+- `sentinel inspect FILE [--script-host] [--site-host ...] [--fail-on] [--json]` runs the
+  heuristics on a local file with no database (exit 5 under `--fail-on`).
+  `sentinel scripts inspect SITE LOCATOR [--version]` and
+  `GET /v1/sites/{name}/scripts/{id}/inspect?version=` run them on a stored version,
+  read-only. `scripts diff`, the diff endpoint and `findings show` print or return the
+  verdicts and new signals. `scan run` no longer marks a script `~` for a finding that
+  isn't a change.
+- `jstokens.py` now owns the literal helpers (`unescape`, `string_value`, `urls_in`),
+  shared by `changes.references` and the heuristics.
+- `tests/fixtures/heuristics/`: a corpus of 13 inert, skimmer-shaped samples and 7 benign
+  look-alikes, each declaring its context and the exact verdicts it must get.
+- CI: a step runs `sentinel inspect` on the corpus (a skimmer fails `--fail-on high`, the
+  PSP library given its own host passes, a hidden loader host is reported); the fixture
+  smoke test checks the planted beacon's verdict and adds a page that already runs a
+  base64-hidden pixel skimmer, expecting a `critical` `script.suspicious` with the hidden
+  host and a matching `scripts inspect`.
+- README: a skimmer heuristics walkthrough, the "Review a change" walkthrough re-recorded
+  from a fresh real run (the finding now carries the verdicts), new commands and endpoint,
+  design notes.
+
+**Tests**
+
+- 542 tests locally on Python 3.13 against SQLite and PostgreSQL 16 (112 new), 100% line
+  and branch coverage. Ruff and mypy (strict) are clean.
+- New: `test_heuristics.py` (the corpus with exact verdicts, decoding and its failure
+  cases, folding and its cap, computed members, escaped strings and identifiers,
+  templates, every sink and destination kind, look-alikes that aren't sinks, bindings,
+  every collection, wallet, obfuscation and injection rule, truncation, serialization,
+  verdict combinations and the "needs a new signal" rule); `test_changes.py` (suspicious
+  severity, verdicts raising added and changed scripts, hidden hosts as referenced hosts);
+  `test_findings.py` (a skimmer on the first scan, a medium one staying in the baseline,
+  new scripts carrying verdicts, first-party destinations staying quiet, inspecting stored
+  versions); API and CLI tests for `inspect`, `scripts inspect`, the diff and finding
+  output, and findings stored before today.
+- Rough cost, measured locally once: `inspect()` on a 1.25 MB concatenation of the benign
+  corpus took about 0.8 s.
+- Both CI smoke scripts and the new corpus step were run locally against PostgreSQL 16
+  before pushing, and the README output comes from a real run.
+
+**Known limitations (deliberate for now)**
+
+- Static analysis only: data flow is followed through literal assignments, not through
+  functions, objects or arrays, so `fetch(cfg.endpoint)` is "computed at runtime". Day 11's
+  renderer will see what actually runs.
+- The rules can be evaded by anyone who reads them, and some legitimate code trips
+  `medium` verdicts (old `'<scr' + 'ipt>'` snippets read as hidden text, for example). A
+  verdict says where to look; it never approves anything.
+- Scripts already in the inventory are not re-inspected until they change;
+  `sentinel scripts inspect` covers them on demand.
+
+**Next (day 7):** the CSP report collector. `report-uri` and Reporting API formats, schema
+validation, size limits, per-site rate limits, dedupe and fingerprinting.
