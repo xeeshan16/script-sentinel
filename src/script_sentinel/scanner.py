@@ -453,6 +453,7 @@ async def record_scan(
         list(activities.values()),
         baseline=baseline,
         hosts=hosts,
+        own_hosts=findings.site_hosts(site),
         clock=clock,
     )
 

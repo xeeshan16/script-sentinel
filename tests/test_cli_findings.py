@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from pathlib import Path
 
 import pytest
+from sqlalchemy import update
 from typer.testing import CliRunner
 
+from script_sentinel import heuristics
 from script_sentinel.cli import app
+from script_sentinel.db import make_engine
+from script_sentinel.db.models import Finding
 from tests.conftest import FixtureSite
 
 runner = CliRunner()
@@ -51,7 +57,7 @@ def test_scan_run_reports_findings_and_gates_on_severity(
     assert lines[start + 1].endswith(f"Script changed: {vendor}")
     assert lines[start + 2] == (
         "           the code changed; references new hosts: collect.evil.test; "
-        "runs on a payment page"
+        "reads cookie and sends data to collect.evil.test; runs on a payment page"
     )
     # No new finding on the next scan: the gate passes, the unauthorized one still fails.
     assert runner.invoke(app, ["scan", "run", "shop", "--fail-on", "low", *url]).exit_code == 0
@@ -198,3 +204,135 @@ def test_scripts_diff(shop: tuple[list[str], str], cdn: FixtureSite) -> None:
     assert back["hosts_removed"] == ["collect.evil.test"]
     assert _invoke("scripts", "diff", "shop", vendor, "--from", "q", *url)[0] == 2
     assert _invoke("scripts", "diff", "shop", "https://nope.test/x.js", *url)[0] == 1
+
+
+CORPUS = Path(__file__).parent / "fixtures" / "heuristics"
+
+
+def test_inspect_a_local_file() -> None:
+    skimmer = str(CORPUS / "malicious" / "card_beacon.js")
+    code, out = _invoke("inspect", skimmer)
+    assert code == 0
+    lines = out.splitlines()
+    assert lines[0] == skimmer
+    assert lines[1] == "  verdicts:"
+    assert lines[2].startswith("    HIGH     skimmer.card_data: reads payment card fields")
+    assert "  signals (5):" in lines
+    assert "    exfil.beacon  collect.skim.test  [literal]" in lines
+    code, out = _invoke("inspect", skimmer, "--fail-on", "high", "--json")
+    assert code == 5
+    data = json.loads(out)
+    assert data["worst"] == "high"
+    assert [v["rule"] for v in data["verdicts"]] == ["skimmer.card_data", "skimmer.form_data"]
+    # The PSP library posting card fields to its own host is fine, given that host.
+    psp = str(CORPUS / "benign" / "psp_elements.js")
+    assert _invoke("inspect", psp, "--fail-on", "low")[0] == 5
+    code, out = _invoke("inspect", psp, "--script-host", "PAY.vendor.test", "--fail-on", "low")
+    assert code == 0
+    assert "  verdicts: none" in out.splitlines()
+    data = json.loads(_invoke("inspect", psp, "--script-host", "pay.vendor.test", "--json")[1])
+    assert (data["worst"], data["verdicts"]) == (None, [])
+    first_party = str(CORPUS / "benign" / "checkout_form.js")
+    code, out = _invoke("inspect", first_party, "--site-host", "shop.example.test")
+    assert "  verdicts: none" in out.splitlines()
+    assert _invoke("inspect", str(CORPUS / "missing.js"))[0] == 2
+
+
+def test_inspect_reports_hidden_hosts_and_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loader = str(CORPUS / "malicious" / "loader.js")
+    lines = _invoke("inspect", loader)[1].splitlines()
+    assert "  hidden hosts: loader.skim.test" in lines
+    monkeypatch.setattr(heuristics, "MAX_SIGNAL_KEYS", 1)
+    many = tmp_path / "many.js"
+    many.write_text('fetch("/a"); fetch("/b"); fetch("/a"); document.cookie;')
+    lines = _invoke("inspect", str(many))[1].splitlines()
+    assert "    exfil.fetch  relative  [relative]  x3" in lines
+    assert "  (only the first 1 distinct signals were kept)" in lines
+
+
+def test_scripts_inspect_and_suspicious_findings(
+    sqlite_url: str, fixture_site: FixtureSite, cdn: FixtureSite
+) -> None:
+    url = ["--url", sqlite_url]
+    vendor = cdn.url("/sdk/widget.js")
+    skimmer = (CORPUS / "malicious" / "card_beacon.js").read_bytes()
+    cdn.set("/sdk/widget.js", skimmer, content_type="text/javascript")
+    fixture_site.page("/checkout", f'<script src="{vendor}"></script><script>pay();</script>')
+    _invoke("sites", "add", "shop", "-o", fixture_site.origin, *url)
+    _invoke("pages", "add", "shop", fixture_site.url("/checkout"), "--payment", *url)
+    # Already there on the first scan: reported, though the first scan is the baseline.
+    code, out = _invoke("scan", "run", "shop", "--fail-on", "high", *url)
+    assert code == 5
+    lines = out.splitlines()
+    assert f"      ~ {vendor}" not in out  # not a change
+    start = lines.index("findings: 1 (review with: sentinel findings show ID)")
+    assert lines[start + 1].endswith(f"Suspicious script on a payment page: {vendor}")
+    [finding] = json.loads(_invoke("findings", "list", "shop", "--json", *url)[1])
+    lines = _invoke("findings", "show", finding["id"], *url)[1].splitlines()
+    assert "  verdicts:" in lines
+    assert "  signals (5):" in lines
+    assert "    collect.card_field  cc-number" in lines
+
+    code, out = _invoke("scripts", "inspect", "shop", vendor, *url)
+    assert code == 0
+    lines = out.splitlines()
+    assert lines[0] == vendor
+    assert lines[1].startswith("  version sha384-")
+    assert lines[2] == "  its own hosts: 127.0.0.1"
+    assert lines[3] == "  verdicts:"
+    data = json.loads(_invoke("scripts", "inspect", "shop", vendor, "--json", *url)[1])
+    assert data["context"] == {"script_host": "127.0.0.1", "site_hosts": ["127.0.0.1"]}
+    assert data["worst"] == "high"
+    assert data["version"]["sri"].startswith("sha384-")
+    code, out = _invoke(
+        "scripts", "inspect", "shop", vendor, "--version", data["version"]["sha384"][:12], *url
+    )
+    assert code == 0
+    inline = fixture_site.url("/checkout#inline-1")
+    data = json.loads(_invoke("scripts", "inspect", "shop", inline, "--json", *url)[1])
+    assert (data["context"]["script_host"], data["worst"]) == (None, None)
+    lines = _invoke("scripts", "inspect", "shop", inline, *url)[1].splitlines()
+    assert "  verdicts: none" in lines
+    assert _invoke("scripts", "inspect", "shop", vendor, "--version", "q", *url)[0] == 2
+
+    # The vendor ships a clean body: the diff shows no new behaviour, and no verdicts.
+    cdn.set("/sdk/widget.js", b"window.q = [];", content_type="text/javascript")
+    _invoke("scan", "run", "shop", *url)
+    lines = _invoke("scripts", "diff", "shop", vendor, *url)[1].splitlines()
+    assert "  verdicts:" not in lines
+    # ...and going back to the skimmer is a change whose diff carries the verdicts.
+    cdn.set("/sdk/widget.js", skimmer, content_type="text/javascript")
+    _invoke("scan", "run", "shop", *url)
+    lines = _invoke("scripts", "diff", "shop", vendor, *url)[1].splitlines()
+    assert "  verdicts:" in lines
+    assert "  new signals (5):" in lines
+    changed = json.loads(_invoke("findings", "list", "shop", "--json", *url)[1])[0]
+    lines = _invoke("findings", "show", changed["id"], *url)[1].splitlines()
+    assert "  new signals (5):" in lines
+
+
+def test_findings_from_before_the_heuristics_show_without_them(
+    sqlite_url: str, shop: tuple[list[str], str], cdn: FixtureSite, fixture_site: FixtureSite
+) -> None:
+    url, _ = shop
+    fixture_site.page(
+        "/checkout",
+        f'<script src="{cdn.url("/sdk/widget.js")}"></script><script>pay();</script>'
+        "<script>late();</script>",
+    )
+    [added] = json.loads(_invoke("scan", "run", "shop", "--json", *url)[1])["findings"]
+    lines = _invoke("findings", "show", added["id"], *url)[1].splitlines()
+    assert "  verdicts: none" in lines
+
+    # Stored before day 6: no verdicts key at all.
+    async def strip() -> None:
+        engine = make_engine(sqlite_url)
+        async with engine.begin() as conn:
+            await conn.execute(update(Finding).values(detail={"reasons": ["old"], "pages": []}))
+        await engine.dispose()
+
+    asyncio.run(strip())
+    lines = _invoke("findings", "show", added["id"], *url)[1].splitlines()
+    assert not any("verdicts" in line for line in lines)

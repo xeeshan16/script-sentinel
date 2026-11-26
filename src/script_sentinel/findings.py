@@ -12,7 +12,14 @@ with what it served at the end of the previous successful fetch
 * a script that appears on a page that an earlier scan already inventoried raises
   ``script.added``. A page's first successful scan is its baseline: the scripts found
   there are recorded, not reported, so adding a page to monitoring doesn't flood the
-  findings.
+  findings;
+* except that a script on a page's first scan whose code the skimmer heuristics flag
+  (a ``high`` verdict or worse) raises ``script.suspicious``, so a skimmer that was
+  already running when monitoring started doesn't quietly become the baseline.
+
+Every finding on a body carries the heuristics' evidence: for a change, the signals the new
+body added and the verdicts on them; for a new or suspicious script, all of its signals
+and verdicts. "Its own" destinations are the script's host and the site's origins.
 
 The severity rules are in :mod:`script_sentinel.changes`. Handling a finding (acknowledge,
 resolve, reopen) records who did it and why, and goes to the site's audit trail, so the
@@ -42,6 +49,7 @@ from script_sentinel.changes import (
     entropy,
     references,
     severity_at_least,
+    suspicious_severity,
 )
 from script_sentinel.db.models import (
     Finding,
@@ -58,9 +66,11 @@ from script_sentinel.db.models import (
     utcnow,
 )
 from script_sentinel.diff import similarity
+from script_sentinel.heuristics import Context, Report, Verdict, assess, inspect
 from script_sentinel.sites import NotFoundError, ValidationError, get_site
 
 MAX_NOTE = 2_000
+MAX_STORED_SIGNALS = 50
 
 
 @dataclass(slots=True)
@@ -129,6 +139,22 @@ def _host(locator: str) -> str | None:
         return None
 
 
+def site_hosts(site: Site) -> frozenset[str]:
+    """The hosts of the site's own origins."""
+    return frozenset(h for h in (_host(origin) for origin in site.allowed_origins) if h)
+
+
+def context_for(script: Script, site_hosts: frozenset[str]) -> Context:
+    """What counts as the script's own destination: its host and the site's."""
+    host = _host(script.locator) if script.kind is ScriptKind.EXTERNAL else None
+    return Context(script_host=host, site_hosts=site_hosts)
+
+
+def inspect_body(text: str, context: Context) -> tuple[Report, list[Verdict]]:
+    report = inspect(text)
+    return report, assess(report, context)
+
+
 async def known_hosts(session: AsyncSession, site: Site) -> set[str]:
     """Hosts of the site's own origins and of every external script it has served."""
     locators = await session.scalars(
@@ -186,12 +212,14 @@ async def detect(
     *,
     baseline: set[str],
     hosts: set[str],
+    own_hosts: frozenset[str] = frozenset(),
     clock: Callable[[], datetime] = utcnow,
 ) -> list[Finding]:
     """Raise the findings for one scan (see the module docs). Adds them to the session.
 
     ``baseline`` holds the pages inventoried before this scan (see
-    :func:`baseline_pages`), and ``hosts`` the hosts known before it (:func:`known_hosts`).
+    :func:`baseline_pages`), ``hosts`` the hosts known before it (:func:`known_hosts`) and
+    ``own_hosts`` the hosts of the site's origins (:func:`site_hosts`).
     """
     wanted: set[uuid.UUID] = set()
     for activity in activities:
@@ -205,47 +233,70 @@ async def detect(
     raised: list[Finding] = []
     for activity in sorted(activities, key=lambda a: a.script.locator):
         before = [bodies[uuid.UUID(v)] for v in activity.previous_ids if uuid.UUID(v) in bodies]
+        context = context_for(activity.script, own_hosts)
         if activity.is_new:
             if activity.pages & baseline:
-                raised.append(_added(scan, activity, bodies, hosts, now))
+                raised.append(await _added(scan, activity, bodies, hosts, context, now))
+            else:
+                suspicious = await _suspicious(scan, activity, bodies, context, now)
+                if suspicious is not None:
+                    raised.append(suspicious)
             continue
         if not before:
             continue
         for new_id in sorted(activity.served_ids - {b.id for b in before}):
             new = bodies[new_id]
             old = _closest(new, before)
-            raised.append(await _changed(scan, activity, old, new, now))
+            raised.append(await _changed(scan, activity, old, new, context, now))
     for finding in raised:
         session.add(finding)
     return raised
 
 
-def _added(
+def _served(activity: ScriptActivity, bodies: dict[uuid.UUID, _Body]) -> list[_Body]:
+    return sorted((bodies[i] for i in activity.served_ids if i in bodies), key=lambda b: b.id)
+
+
+def _heuristics_detail(report: Report, verdicts: Sequence[Verdict]) -> dict[str, Any]:
+    return {
+        "signals": [s.to_dict() for s in report.signals[:MAX_STORED_SIGNALS]],
+        "signals_truncated": report.truncated or len(report.signals) > MAX_STORED_SIGNALS,
+        "hidden_hosts": sorted(report.hidden_hosts),
+        "verdicts": [v.to_dict() for v in verdicts],
+    }
+
+
+async def _added(
     scan: Scan,
     activity: ScriptActivity,
     bodies: dict[uuid.UUID, _Body],
     hosts: set[str],
+    context: Context,
     now: datetime,
 ) -> Finding:
     script = activity.script
     inline = script.kind is ScriptKind.INLINE
     host = None if inline else _host(script.locator)
-    assessment = added_severity(
-        inline=inline,
-        new_host=host is not None and host not in hosts,
-        payment_page=activity.payment_page,
-    )
     detail: dict[str, Any] = {**_pages_detail(activity), "host": host}
-    served = sorted((bodies[i] for i in activity.served_ids if i in bodies), key=lambda b: b.id)
+    served = _served(activity, bodies)
+    verdicts: list[Verdict] = []
     if served:
         body = served[0]
         refs = references(body.text)
+        report, verdicts = await asyncio.to_thread(inspect_body, body.text, context)
         detail.update(
             sha384=body.sha384,
             size=body.size_bytes,
             entropy=entropy(body.text),
-            hosts_referenced=sorted(refs.hosts),
+            hosts_referenced=sorted(refs.hosts | report.hidden_hosts),
+            **_heuristics_detail(report, verdicts),
         )
+    assessment = added_severity(
+        inline=inline,
+        new_host=host is not None and host not in hosts,
+        payment_page=activity.payment_page,
+        verdicts=verdicts,
+    )
     where = "a payment page" if activity.payment_page else f"{len(activity.pages)} page(s)"
     what = "inline script" if inline else "external script"
     return _finding(
@@ -260,15 +311,61 @@ def _added(
     )
 
 
+async def _suspicious(
+    scan: Scan,
+    activity: ScriptActivity,
+    bodies: dict[uuid.UUID, _Body],
+    context: Context,
+    now: datetime,
+) -> Finding | None:
+    """A script on a page's first scan that the heuristics flag, or ``None``."""
+    served = _served(activity, bodies)
+    if not served:
+        return None
+    body = served[0]
+    report, verdicts = await asyncio.to_thread(inspect_body, body.text, context)
+    assessment = suspicious_severity(verdicts, payment_page=activity.payment_page)
+    if assessment is None:
+        return None
+    script = activity.script
+    where = "a payment page" if activity.payment_page else f"{len(activity.pages)} page(s)"
+    return _finding(
+        scan,
+        script,
+        FindingKind.SCRIPT_SUSPICIOUS,
+        assessment,
+        f"Suspicious script on {where}: {script.locator}",
+        {
+            **_pages_detail(activity),
+            "host": _host(script.locator) if script.kind is ScriptKind.EXTERNAL else None,
+            "sha384": body.sha384,
+            "size": body.size_bytes,
+            **_heuristics_detail(report, verdicts),
+        },
+        version_id=body.id,
+        created_at=now,
+    )
+
+
 async def _changed(
-    scan: Scan, activity: ScriptActivity, old: _Body, new: _Body, now: datetime
+    scan: Scan,
+    activity: ScriptActivity,
+    old: _Body,
+    new: _Body,
+    context: Context,
+    now: datetime,
 ) -> Finding:
     script = activity.script
     cosmetic = old.normalized_sha384 is not None and old.normalized_sha384 == new.normalized_sha384
     # The body existed before this scan: the script went back to something it served.
     reverted = new.first_seen_at < scan.started_at
     analysis = await asyncio.to_thread(
-        analyze_change, old.text, new.text, old_size=old.size_bytes, new_size=new.size_bytes
+        analyze_change,
+        old.text,
+        new.text,
+        old_size=old.size_bytes,
+        new_size=new.size_bytes,
+        context=context,
     )
     assessment = change_severity(
         analysis, cosmetic=cosmetic, reverted=reverted, payment_page=activity.payment_page

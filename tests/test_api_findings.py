@@ -134,3 +134,40 @@ def test_script_diff_endpoint(
     only_one = client.get(f"/v1/sites/shop/scripts/{inline['id']}/diff")
     assert only_one.status_code == 422
     assert client.get(f"/v1/sites/shop/scripts/{uuid.uuid4()}/diff").status_code == 404
+    # The diff carries what the new body does: an image pixel to another host.
+    assert [s["rule"] for s in body["signals_added"]] == ["exfil.image"]
+    assert [v["rule"] for v in body["verdicts"]] == ["exfil.outbound"]
+
+
+def test_script_inspect_endpoint(
+    client: TestClient, fixture_site: FixtureSite, cdn: FixtureSite
+) -> None:
+    _changed_shop(client, fixture_site, cdn)
+    scripts = client.get("/v1/sites/shop/scripts").json()["scripts"]
+    vendor = next(s for s in scripts if s["kind"] == "external")
+    base = f"/v1/sites/shop/scripts/{vendor['id']}/inspect"
+    body = client.get(base).json()
+    assert body["locator"] == cdn.url("/sdk/widget.js")
+    assert body["context"] == {"script_host": "127.0.0.1", "site_hosts": ["127.0.0.1"]}
+    [signal] = body["signals"]
+    assert (signal["rule"], signal["key"], signal["destination"]) == (
+        "exfil.image",
+        "px.evil.test",
+        "literal",
+    )
+    assert body["worst"] == "low"
+    assert body["hidden_hosts"] == []
+    assert body["truncated"] is False
+    versions = client.get(f"/v1/sites/shop/scripts/{vendor['id']}").json()["versions"]
+    assert body["version"]["id"] == versions[0]["id"]  # the latest by default
+    older = client.get(base, params={"version": versions[1]["sha384"][:10]}).json()
+    assert (older["version"]["id"], older["signals"], older["worst"]) == (
+        versions[1]["id"],
+        [],
+        None,
+    )
+    assert client.get(base, params={"version": "zz"}).status_code == 422
+    assert client.get(f"/v1/sites/shop/scripts/{uuid.uuid4()}/inspect").status_code == 404
+    inline = next(s for s in scripts if s["kind"] == "inline")
+    clean = client.get(f"/v1/sites/shop/scripts/{inline['id']}/inspect").json()
+    assert (clean["signals"], clean["verdicts"], clean["worst"]) == ([], [], None)

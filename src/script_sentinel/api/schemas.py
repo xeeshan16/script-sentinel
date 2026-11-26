@@ -407,7 +407,9 @@ class ChainOut(BaseModel):
 
 class FindingOut(BaseModel):
     id: uuid.UUID
-    kind: str = Field(examples=["script.changed", "script.added", "script.reformatted"])
+    kind: str = Field(
+        examples=["script.changed", "script.added", "script.reformatted", "script.suspicious"]
+    )
     severity: Severity
     status: FindingStatus
     title: str
@@ -446,8 +448,9 @@ class FindingOut(BaseModel):
 class FindingDetail(FindingOut):
     site: str
     detail: dict[str, Any] = Field(
-        description="The evidence: reasons for the severity, pages, and for a change the "
-        "token diff, size and entropy deltas and newly referenced hosts and URLs."
+        description="The evidence: reasons for the severity, pages, the skimmer heuristics' "
+        "signals and verdicts, and for a change the token diff, size and entropy deltas and "
+        "newly referenced hosts and URLs."
     )
 
 
@@ -493,6 +496,43 @@ class TokenStatsOut(BaseModel):
     similarity: float
 
 
+class SignalOut(BaseModel):
+    rule: str = Field(examples=["exfil.beacon", "collect.card_field", "wallet.address"])
+    category: str = Field(examples=["exfiltration", "collection", "obfuscation"])
+    key: str = Field(description="What tells two signals of a rule apart: a host, a field...")
+    count: int
+    evidence: str = Field(description="The code where it first occurs, whitespace collapsed.")
+    offset: int = Field(description="Character offset of that place in the body.")
+    host: str | None = None
+    destination: str | None = Field(
+        default=None, description="For sinks and injections: literal, hidden, relative, unknown."
+    )
+
+
+class VerdictOut(BaseModel):
+    rule: str = Field(examples=["skimmer.card_data", "wallet.swap", "inject.hidden_source"])
+    severity: Severity
+    reason: str
+    signals: list[dict[str, str]] = Field(description="The (rule, key) signals behind it.")
+
+
+class InspectionContextOut(BaseModel):
+    script_host: str | None = Field(description="The host an external script is served from.")
+    site_hosts: list[str] = Field(description="The hosts of the site's origins.")
+
+
+class InspectionOut(BaseModel):
+    script_id: uuid.UUID
+    locator: str
+    version: VersionOut
+    context: InspectionContextOut
+    signals: list[SignalOut]
+    hidden_hosts: list[str]
+    truncated: bool
+    verdicts: list[VerdictOut]
+    worst: Severity | None
+
+
 class DiffOut(BaseModel):
     script_id: uuid.UUID
     locator: str
@@ -505,6 +545,10 @@ class DiffOut(BaseModel):
     hosts_removed: list[str]
     urls_added: list[str]
     urls_removed: list[str]
+    signals_added: list[SignalOut] = Field(
+        description="What the new body does that the old didn't."
+    )
+    verdicts: list[VerdictOut]
     coarse: bool = Field(description="Parts were compared statement by statement.")
     hunk_count: int
     hunks: list[HunkOut]

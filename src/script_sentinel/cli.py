@@ -6,14 +6,25 @@ import asyncio
 import getpass
 import json
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Annotated, Any
 
 import typer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from script_sentinel import __version__, audit, authorization, findings, scanner, sites, versions
+from script_sentinel import (
+    __version__,
+    audit,
+    authorization,
+    findings,
+    heuristics,
+    scanner,
+    sites,
+    versions,
+)
+from script_sentinel.changes import severity_at_least
 from script_sentinel.config import Settings
 from script_sentinel.db import make_engine, make_sessionmaker
 from script_sentinel.db.models import (
@@ -68,7 +79,7 @@ app.add_typer(policies_app, name="policies")
 audit_app = typer.Typer(help="Read and verify the authorization audit trail.", no_args_is_help=True)
 app.add_typer(audit_app, name="audit")
 findings_app = typer.Typer(
-    help="Review what scans noticed: new scripts and changed bodies, with diffs.",
+    help="Review what scans noticed: new, changed and suspicious scripts, with evidence.",
     no_args_is_help=True,
 )
 app.add_typer(findings_app, name="findings")
@@ -79,7 +90,7 @@ EXIT_SCAN_INCOMPLETE = 3
 # isn't approved (it wins over EXIT_SCAN_INCOMPLETE)...
 EXIT_UNAUTHORIZED = 4
 # ...and with this, under --fail-on SEVERITY, when the scan raised a finding at least that
-# severe (it wins over both).
+# severe (it wins over both). `sentinel inspect --fail-on` uses it for a verdict that severe.
 EXIT_FINDINGS = 5
 
 DatabaseURL = Annotated[
@@ -501,7 +512,8 @@ class _Changes:
             {
                 f.script_id
                 for f in raised
-                if f.script_id is not None and f.kind != FindingKind.SCRIPT_ADDED
+                if f.script_id is not None
+                and f.kind in (FindingKind.SCRIPT_CHANGED, FindingKind.SCRIPT_REFORMATTED)
             },
         )
 
@@ -925,6 +937,149 @@ def _print_analysis(detail: dict[str, Any], hunks_text: str) -> None:
         typer.echo(hunks_text)
 
 
+def _print_verdicts(verdicts: Sequence[dict[str, Any]]) -> None:
+    if not verdicts:
+        typer.echo("  verdicts: none")
+        return
+    typer.echo("  verdicts:")
+    for verdict in verdicts:
+        severity = Severity(verdict["severity"])
+        typer.secho(
+            f"    {severity.value.upper():<8} {verdict['rule']}: {verdict['reason']}",
+            fg=_SEVERITY_COLOR[severity],
+            bold=severity is Severity.CRITICAL,
+        )
+
+
+def _print_signals(signals: Sequence[dict[str, Any]], label: str = "signals") -> None:
+    if not signals:
+        return
+    typer.echo(f"  {label} ({len(signals)}):")
+    for signal in signals:
+        where = f"  [{signal['destination']}]" if signal.get("destination") else ""
+        count = f"  x{signal['count']}" if signal.get("count", 1) > 1 else ""
+        typer.echo(f"    {signal['rule']}  {signal['key']}{where}{count}")
+        typer.echo(f"      {signal['evidence']}")
+
+
+def _print_report(report: dict[str, Any], verdicts: Sequence[dict[str, Any]]) -> None:
+    _print_verdicts(verdicts)
+    _print_signals(report["signals"])
+    if report["hidden_hosts"]:
+        typer.echo(f"  hidden hosts: {', '.join(report['hidden_hosts'])}")
+    if report["truncated"]:
+        typer.echo(f"  (only the first {heuristics.MAX_SIGNAL_KEYS} distinct signals were kept)")
+
+
+@app.command("inspect")
+def inspect_file(
+    path: Annotated[
+        Path, typer.Argument(exists=True, dir_okay=False, readable=True, help="A .js file.")
+    ],
+    script_host: Annotated[
+        str | None,
+        typer.Option(help="The host the script is served from; sending data there is fine."),
+    ] = None,
+    site_host: Annotated[
+        list[str] | None,
+        typer.Option(help="A host of the site itself (repeatable); also fine to send to."),
+    ] = None,
+    fail_on: Annotated[
+        Severity | None,
+        typer.Option(
+            "--fail-on",
+            help="Exit 5 when a verdict is at least this severe.",
+            case_sensitive=False,
+        ),
+    ] = None,
+    as_json: JsonOutput = False,
+) -> None:
+    """Run the skimmer heuristics on a local file. Needs no database.
+
+    Useful on a vendor script before you approve it, or on your own bundles in CI.
+    """
+    text = versions.decode_script(path.read_bytes())
+    context = heuristics.Context(
+        script_host=script_host.lower() if script_host else None,
+        site_hosts=frozenset(h.lower() for h in site_host or ()),
+    )
+    report, verdicts = findings.inspect_body(text, context)
+    worst = heuristics.worst(verdicts)
+    verdict_dicts = [v.to_dict() for v in verdicts]
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "path": str(path),
+                    **report.to_dict(),
+                    "verdicts": verdict_dicts,
+                    "worst": worst.value if worst else None,
+                },
+                indent=2,
+            )
+        )
+    else:
+        typer.echo(str(path))
+        _print_report(report.to_dict(), verdict_dicts)
+    if fail_on is not None and worst is not None and severity_at_least(worst, fail_on):
+        raise typer.Exit(code=EXIT_FINDINGS)
+
+
+@scripts_app.command("inspect")
+def scripts_inspect(
+    site: str,
+    locator: Locator,
+    version_ref: Annotated[
+        str | None,
+        typer.Option(
+            "--version", help="Version id, or a SHA-384 or SRI prefix. Default: the latest."
+        ),
+    ] = None,
+    as_json: JsonOutput = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Run the skimmer heuristics on a script's stored body (read-only).
+
+    Shows everything the code does, not only what a change added: handy for scripts that
+    were inventoried before a change ever raised a finding.
+    """
+
+    async def work(session: AsyncSession) -> versions.VersionInspection:
+        script = await versions.find_script(session, site, locator)
+        return await versions.inspect_version(session, site, script.id, ref=version_ref)
+
+    result = _run(url, work)
+    report = result.report.to_dict()
+    verdict_dicts = [v.to_dict() for v in result.verdicts]
+    worst = heuristics.worst(result.verdicts)
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "locator": result.script.locator,
+                    "version": _version_json(result.version),
+                    "context": {
+                        "script_host": result.context.script_host,
+                        "site_hosts": sorted(result.context.site_hosts),
+                    },
+                    **report,
+                    "verdicts": verdict_dicts,
+                    "worst": worst.value if worst else None,
+                },
+                indent=2,
+            )
+        )
+        return
+    typer.echo(result.script.locator)
+    typer.echo(
+        f"  version {result.version.sri}  "
+        f"(first seen {result.version.first_seen_at:%Y-%m-%d %H:%M}Z)"
+    )
+    own = sorted(result.context.trusted)
+    typer.echo(f"  its own hosts: {', '.join(own) if own else '(none)'}")
+    _print_report(report, verdict_dicts)
+
+
 @scripts_app.command("diff")
 def scripts_diff(
     site: str,
@@ -956,7 +1111,7 @@ def scripts_diff(
         )
 
     result = _run(url, work)
-    detail = result.analysis.to_dict(max_hunks=max_hunks)
+    detail: dict[str, Any] = result.analysis.to_dict(max_hunks=max_hunks)
     if as_json:
         typer.echo(
             json.dumps(
@@ -976,6 +1131,9 @@ def scripts_diff(
     if result.analysis.diff.identical:
         typer.echo("  same code: only comments or whitespace differ")
     _print_analysis(detail, render_diff(result.analysis.diff, max_hunks=max_hunks))
+    if detail["verdicts"] or detail["signals_added"]:
+        _print_verdicts(detail["verdicts"])
+        _print_signals(detail["signals_added"], "new signals")
 
 
 def _decision(
@@ -1401,8 +1559,15 @@ def findings_show(
         hunks = [Hunk.from_dict(h) for h in detail.get("hunks") or []]
         text = render_hunks(hunks, max_hunks=max_hunks, total=detail.get("hunk_count"))
         _print_analysis(detail, text)
-    elif detail.get("hosts_referenced"):
-        typer.echo(f"  hosts referenced: {', '.join(detail['hosts_referenced'][:10])}")
+        if detail.get("verdicts") or detail.get("signals_added"):
+            _print_verdicts(detail.get("verdicts", []))
+            _print_signals(detail.get("signals_added", []), "new signals")
+    else:
+        if detail.get("hosts_referenced"):
+            typer.echo(f"  hosts referenced: {', '.join(detail['hosts_referenced'][:10])}")
+        if "verdicts" in detail:  # findings raised before the heuristics existed have none
+            _print_verdicts(detail["verdicts"])
+            _print_signals(detail.get("signals", []))
 
 
 def _set_finding(

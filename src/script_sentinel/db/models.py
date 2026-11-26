@@ -132,6 +132,8 @@ class FindingKind(enum.StrEnum):
     SCRIPT_CHANGED = "script.changed"  # a script serving a body it didn't serve last time
     # A new body whose normalized form (comments and whitespace aside) is unchanged.
     SCRIPT_REFORMATTED = "script.reformatted"
+    # A script on a page's first scan that the skimmer heuristics flag (high or worse).
+    SCRIPT_SUSPICIOUS = "script.suspicious"
 
 
 class FindingStatus(enum.StrEnum):

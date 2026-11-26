@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from script_sentinel.jstokens import TokenKind, normalize, normalized_sha384, tokenize
+from script_sentinel.jstokens import (
+    TokenKind,
+    normalize,
+    normalized_sha384,
+    string_value,
+    tokenize,
+)
 
 
 def texts(source: str) -> list[str]:
@@ -168,3 +174,21 @@ def test_normalize_keeps_what_changes_behaviour() -> None:
     assert normalize("s = 'a // b'") != normalize("s = 'a'")
     assert normalized_sha384("x") != normalized_sha384("y")
     assert len(normalized_sha384("")) == 96
+
+
+def test_string_values() -> None:
+    def value(source: str) -> list[str]:
+        return [
+            string_value(t)
+            for t in tokenize(source).tokens
+            if t.kind in (TokenKind.STRING, TokenKind.TEMPLATE)
+        ]
+
+    bs = chr(92)  # a backslash, spelled out
+    assert value(f"\"a{bs}nb{bs}x41{bs}u0042{bs}u{{43}}{bs}q\" 'it{bs}'s'") == ["a\nbABCq", "it's"]
+    assert value(f'"line{bs}\ncontinued" "{bs}u{{110000}}"') == [
+        "linecontinued",
+        f"{bs}u{{110000}}",
+    ]
+    assert value('"unterminated') == ["unterminated"]
+    assert value("`a${b}c${d}e` `whole` `open") == ["a", "c", "e", "whole", "open"]

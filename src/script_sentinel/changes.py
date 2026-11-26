@@ -1,8 +1,10 @@
 """What changed between two versions of a script, and how much it matters.
 
 :func:`analyze_change` compares two bodies and returns a :class:`ChangeAnalysis`: the token
-diff (:mod:`script_sentinel.diff`), the size and entropy before and after, and the URLs and
-hosts each body references in its string literals. :func:`change_severity` and
+diff (:mod:`script_sentinel.diff`), the size and entropy before and after, the URLs and
+hosts each body references in its string literals (plus the hosts it hides, see
+:mod:`script_sentinel.heuristics`), and the skimmer heuristics' signals and verdicts for
+what the new body does that the old one didn't. :func:`change_severity` and
 :func:`added_severity` turn that, plus where the script runs, into a severity. Both are
 pure functions so the rules can be tested and read on their own.
 
@@ -16,46 +18,40 @@ The severity rules (each step can only raise it):
   obfuscation do both;
 * referencing a host the previous body didn't reference makes it ``high``: that is how
   skimmers send data out;
+* each skimmer verdict on the new behaviour raises it to the verdict's severity (reading
+  card fields and sending data to another host is ``high``, for example);
 * running on a payment page raises the result one level (``high`` becomes ``critical``).
 
 A script that appears on a page an earlier scan inventoried is ``low`` when inline and
-``medium`` when external, ``high`` when it comes from a host no other script of the site uses, and
-again one level higher on a payment page.
+``medium`` when external, ``high`` when it comes from a host no other script of the site
+uses, raised to the severity of any skimmer verdict on its code, and again one level higher
+on a payment page.
 
-This is change detection, not malware detection: the skimmer heuristics (day 6) look at
-*what* the new code does. A severity here says how closely a person should look.
+A severity says how closely a person should look; the heuristics say where.
 """
 
 from __future__ import annotations
 
 import math
-import re
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from typing import Any
 
 from script_sentinel.db.models import Severity
 from script_sentinel.diff import TokenDiff, diff_sources, similarity
-from script_sentinel.jstokens import Token, TokenKind, tokenize
+from script_sentinel.heuristics import Context, Signal, Verdict, assess, inspect
+from script_sentinel.jstokens import Token, TokenKind, tokenize, unescape_url_escapes, urls_in
 
 MAX_REFERENCES = 200  # URLs kept per body; hosts are always kept in full
 MAX_STORED_HUNKS = 50
+MAX_STORED_SIGNALS = 50
 
 GROWTH_RATIO = 0.5
 GROWTH_MIN_BYTES = 1024
 ENTROPY_RISE_BITS = 0.3
 
 _ORDER = list(Severity)
-
-# Absolute and protocol-relative URLs inside string and template literals.
-_URL = re.compile(
-    r"""(?:(?<![\w.+-])(?:https?|wss?):)?//"""  # scheme (optional for //host)
-    r"""(?P<host>\[[0-9a-fA-F:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"""
-    r"""(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*)"""
-    r"""(?::\d{1,5})?(?:[/?#][^\s"'`<>\\{}|^]*)?"""
-)
-_ESCAPE = re.compile(r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|u\{([0-9A-Fa-f]{1,6})\}|(/))")
 
 
 def raise_severity(severity: Severity, steps: int = 1) -> Severity:
@@ -79,16 +75,6 @@ def entropy(text: str) -> float:
     return round(-sum(c / total * math.log2(c / total) for c in counts.values()), 4)
 
 
-def _unescape(literal: str) -> str:
-    def replace(match: re.Match[str]) -> str:
-        if match.group(4):
-            return "/"
-        code = int(match.group(1) or match.group(2) or match.group(3), 16)
-        return chr(code) if code < 0x110000 else match.group()
-
-    return _ESCAPE.sub(replace, literal)
-
-
 @dataclass(frozen=True, slots=True)
 class References:
     """The URLs and hosts a body's string and template literals mention."""
@@ -108,21 +94,10 @@ def references(source: str, tokens: Sequence[Token] | None = None) -> References
     for token in tokenize(source).tokens if tokens is None else tokens:
         if token.kind not in (TokenKind.STRING, TokenKind.TEMPLATE):
             continue
-        text = _unescape(token.text) if "\\" in token.text else token.text
+        text = unescape_url_escapes(token.text) if "\\" in token.text else token.text
         if token.kind is TokenKind.TEMPLATE:
             text = text.replace("${", " ")  # a substitution ends the literal text
-        if "//" not in text:
-            continue
-        for match in _URL.finditer(text):
-            host = match.group("host").lower().rstrip(".")
-            if "." not in host and not host.startswith("[") and host != "localhost":
-                continue  # "//comment" or "a//b" in a string, not a host
-            url = match.group()
-            try:
-                parsed = urlsplit(url if not url.startswith("//") else "https:" + url)
-                parsed.port  # noqa: B018 - raises for an out-of-range port
-            except ValueError:
-                continue
+        for url, host in urls_in(text):
             hosts.add(host)
             if len(urls) < MAX_REFERENCES:
                 urls.add(url)
@@ -142,6 +117,9 @@ class ChangeAnalysis:
     hosts_removed: list[str] = field(default_factory=list)
     urls_added: list[str] = field(default_factory=list)
     urls_removed: list[str] = field(default_factory=list)
+    # What the new body does that the old one didn't (see script_sentinel.heuristics).
+    signals_added: list[Signal] = field(default_factory=list)
+    verdicts: list[Verdict] = field(default_factory=list)
 
     @property
     def size_delta(self) -> int:
@@ -163,7 +141,7 @@ class ChangeAnalysis:
         # bodies large enough for the figure to mean something.
         return self.new_size >= GROWTH_MIN_BYTES and self.entropy_delta > ENTROPY_RISE_BITS
 
-    def to_dict(self, *, max_hunks: int = MAX_STORED_HUNKS) -> dict[str, object]:
+    def to_dict(self, *, max_hunks: int = MAX_STORED_HUNKS) -> dict[str, Any]:
         return {
             "size": {"old": self.old_size, "new": self.new_size, "delta": self.size_delta},
             "entropy": {
@@ -182,6 +160,8 @@ class ChangeAnalysis:
             "hosts_removed": self.hosts_removed,
             "urls_added": self.urls_added,
             "urls_removed": self.urls_removed,
+            "signals_added": [s.to_dict() for s in self.signals_added[:MAX_STORED_SIGNALS]],
+            "verdicts": [v.to_dict() for v in self.verdicts],
             "coarse": self.diff.coarse,
             "hunk_count": len(self.diff.hunks),
             "hunks": [h.to_dict() for h in self.diff.hunks[:max_hunks]],
@@ -194,22 +174,32 @@ def analyze_change(
     *,
     old_size: int | None = None,
     new_size: int | None = None,
+    context: Context | None = None,
 ) -> ChangeAnalysis:
-    """Compare two bodies. Sizes default to the UTF-8 length of the decoded text."""
+    """Compare two bodies. Sizes default to the UTF-8 length of the decoded text.
+
+    ``context`` says which hosts count as the script's own for the skimmer verdicts.
+    """
     old_tokens = tokenize(old_source).tokens
     new_tokens = tokenize(new_source).tokens
+    old_report = inspect(old_source, old_tokens)
+    new_report = inspect(new_source, new_tokens)
     old_refs = references(old_source, old_tokens)
     new_refs = references(new_source, new_tokens)
+    old_hosts = old_refs.hosts | old_report.hidden_hosts
+    new_hosts = new_refs.hosts | new_report.hidden_hosts
     return ChangeAnalysis(
         diff=diff_sources(old_source, new_source, old_tokens=old_tokens, new_tokens=new_tokens),
         old_size=len(old_source.encode("utf-8")) if old_size is None else old_size,
         new_size=len(new_source.encode("utf-8")) if new_size is None else new_size,
         old_entropy=entropy(old_source),
         new_entropy=entropy(new_source),
-        hosts_added=sorted(new_refs.hosts - old_refs.hosts),
-        hosts_removed=sorted(old_refs.hosts - new_refs.hosts),
+        hosts_added=sorted(new_hosts - old_hosts),
+        hosts_removed=sorted(old_hosts - new_hosts),
         urls_added=sorted(new_refs.urls - old_refs.urls),
         urls_removed=sorted(old_refs.urls - new_refs.urls),
+        signals_added=new_report.new_since(old_report),
+        verdicts=assess(new_report, context, previous=old_report),
     )
 
 
@@ -244,13 +234,44 @@ def change_severity(
             if analysis.hosts_added:
                 severity = max_severity(severity, Severity.HIGH)
                 reasons.append("references new hosts: " + ", ".join(analysis.hosts_added[:5]))
+        if analysis is not None:
+            # Going back to an earlier body counts too: it may be the skimmer coming back.
+            severity = _apply_verdicts(severity, reasons, analysis.verdicts)
     if payment_page and severity is not Severity.INFO:
         severity = raise_severity(severity)
         reasons.append("runs on a payment page")
     return Assessment(severity, tuple(reasons))
 
 
-def added_severity(*, inline: bool, new_host: bool, payment_page: bool) -> Assessment:
+def _apply_verdicts(
+    severity: Severity, reasons: list[str], verdicts: Sequence[Verdict]
+) -> Severity:
+    for verdict in verdicts:
+        severity = max_severity(severity, verdict.severity)
+        reasons.append(verdict.reason)
+    return severity
+
+
+def suspicious_severity(verdicts: Sequence[Verdict], *, payment_page: bool) -> Assessment | None:
+    """The severity of a script found on a page's first scan, if the heuristics say it
+    looks like a skimmer (a ``high`` verdict or worse); ``None`` otherwise.
+
+    A page's first scan is its baseline and raises nothing by itself, but a skimmer that
+    was already there when monitoring started shouldn't become part of the baseline quietly.
+    """
+    if not any(severity_at_least(v.severity, Severity.HIGH) for v in verdicts):
+        return None
+    reasons = ["found on the page's first scan"]
+    severity = _apply_verdicts(Severity.INFO, reasons, verdicts)
+    if payment_page:
+        severity = raise_severity(severity)
+        reasons.append("runs on a payment page")
+    return Assessment(severity, tuple(reasons))
+
+
+def added_severity(
+    *, inline: bool, new_host: bool, payment_page: bool, verdicts: Sequence[Verdict] = ()
+) -> Assessment:
     """The severity of a script that appeared on a page inventoried before."""
     if inline:
         severity, reasons = Severity.LOW, ["a new inline script"]
@@ -258,6 +279,7 @@ def added_severity(*, inline: bool, new_host: bool, payment_page: bool) -> Asses
         severity, reasons = Severity.HIGH, ["a new external script from a host no other uses"]
     else:
         severity, reasons = Severity.MEDIUM, ["a new external script"]
+    severity = _apply_verdicts(severity, reasons, verdicts)
     if payment_page:
         severity = raise_severity(severity)
         reasons.append("runs on a payment page")

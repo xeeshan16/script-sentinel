@@ -4,7 +4,8 @@ Every body a script serves becomes a :class:`ScriptVersion`, identified within i
 by the SHA-384 of the exact bytes. Seeing the same body again only moves its
 ``last_seen_at``; a body never seen before is a new version, and a new version of a script
 that already had one is a *change*. Changes are what the policy engine and the findings
-(:mod:`script_sentinel.findings`) look at; :func:`diff_versions` compares any two versions.
+(:mod:`script_sentinel.findings`) look at; :func:`diff_versions` compares any two versions
+and :func:`inspect_version` runs the skimmer heuristics on one.
 """
 
 from __future__ import annotations
@@ -21,8 +22,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
+from script_sentinel import findings
 from script_sentinel.changes import ChangeAnalysis, analyze_change
 from script_sentinel.db.models import Script, ScriptVersion
+from script_sentinel.heuristics import Context, Report, Verdict
 from script_sentinel.jstokens import normalized_sha384
 from script_sentinel.sites import NotFoundError, ValidationError, get_site
 from script_sentinel.sri import body_digests
@@ -289,6 +292,7 @@ async def diff_versions(
 
     By default ``to`` is the body seen most recently and ``from`` the one seen before it.
     """
+    site = await get_site(session, site_name)
     script = await get_script(session, site_name, script_id)
     history = (await versions_by_script(session, [script.id]))[script.id]
     if to_ref is not None:
@@ -316,5 +320,38 @@ async def diff_versions(
         texts.get(new.id) or "",
         old_size=old.size_bytes,
         new_size=new.size_bytes,
+        context=findings.context_for(script, findings.site_hosts(site)),
     )
     return VersionDiff(script, old, new, analysis)
+
+
+@dataclass(frozen=True, slots=True)
+class VersionInspection:
+    script: Script
+    version: ScriptVersion
+    context: Context
+    report: Report
+    verdicts: list[Verdict]
+
+
+async def inspect_version(
+    session: AsyncSession, site_name: str, script_id: uuid.UUID, *, ref: str | None = None
+) -> VersionInspection:
+    """Run the skimmer heuristics on a version (default: the body seen most recently).
+
+    Read-only: nothing is recorded. Useful for scripts inventoried before the heuristics
+    existed, or to see everything a script does rather than what a change added.
+    """
+    site = await get_site(session, site_name)
+    script = await get_script(session, site_name, script_id)
+    if ref is not None:
+        version = await resolve_version(session, script, ref)
+    else:
+        history = (await versions_by_script(session, [script.id]))[script.id]
+        if not history:
+            raise ValidationError(f"script {script.locator!r} has no versions yet")
+        version = history[0]
+    text = await session.scalar(select(ScriptVersion.content).where(ScriptVersion.id == version.id))
+    context = findings.context_for(script, findings.site_hosts(site))
+    report, verdicts = await asyncio.to_thread(findings.inspect_body, text or "", context)
+    return VersionInspection(script, version, context, report, verdicts)

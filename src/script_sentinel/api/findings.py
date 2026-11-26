@@ -1,4 +1,4 @@
-"""Findings raised by scans, and diffs between script versions."""
+"""Findings raised by scans, diffs between script versions, and the skimmer heuristics."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query
 
-from script_sentinel import findings, versions
+from script_sentinel import findings, heuristics, versions
 from script_sentinel.api.schemas import (
     DiffOut,
     ErrorOut,
@@ -15,6 +15,7 @@ from script_sentinel.api.schemas import (
     FindingList,
     FindingOut,
     FindingStatusIn,
+    InspectionOut,
     VersionOut,
 )
 from script_sentinel.api.sites import Session
@@ -116,5 +117,34 @@ async def diff_script(
             "from_version": VersionOut.of(result.old),
             "to_version": VersionOut.of(result.new),
             **result.analysis.to_dict(max_hunks=max_hunks),
+        }
+    )
+
+
+@router.get("/v1/sites/{name}/scripts/{script_id}/inspect", responses=_ERRORS)
+async def inspect_script(
+    name: str,
+    script_id: uuid.UUID,
+    session: Session,
+    version: Annotated[str | None, Query(max_length=96)] = None,
+) -> InspectionOut:
+    """Run the skimmer heuristics on a version (by id, or a SHA-384 or SRI prefix).
+
+    Defaults to the body seen most recently. Read-only: nothing is recorded.
+    """
+    result = await versions.inspect_version(session, name, script_id, ref=version)
+    worst = heuristics.worst(result.verdicts)
+    return InspectionOut.model_validate(
+        {
+            "script_id": result.script.id,
+            "locator": result.script.locator,
+            "version": VersionOut.of(result.version),
+            "context": {
+                "script_host": result.context.script_host,
+                "site_hosts": sorted(result.context.site_hosts),
+            },
+            **result.report.to_dict(),
+            "verdicts": [v.to_dict() for v in result.verdicts],
+            "worst": worst,
         }
     )

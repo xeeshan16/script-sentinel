@@ -28,7 +28,9 @@ from __future__ import annotations
 import enum
 import hashlib
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 
 class TokenKind(enum.StrEnum):
@@ -325,3 +327,87 @@ def normalize(source: str) -> str:
 
 def normalized_sha384(source: str) -> str:
     return hashlib.sha384(normalize(source).encode("utf-8")).hexdigest()
+
+
+# --- Literal values ----------------------------------------------------------------------
+
+# Absolute and protocol-relative URLs inside string and template literals.
+URL_PATTERN = re.compile(
+    r"""(?:(?<![\w.+-])(?:https?|wss?):)?//"""  # scheme (optional for //host)
+    r"""(?P<host>\[[0-9a-fA-F:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"""
+    r"""(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*)"""
+    r"""(?::\d{1,5})?(?:[/?#][^\s"'`<>\\{}|^]*)?"""
+)
+_URL_ESCAPE = re.compile(r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|u\{([0-9A-Fa-f]{1,6})\}|(/))")
+_ESCAPE = re.compile(
+    r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|u\{([0-9A-Fa-f]{1,6})\}|(\r\n|[\s\S]))"
+)
+_SINGLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
+
+
+def _code_point(match: re.Match[str]) -> str | None:
+    code = int(match.group(1) or match.group(2) or match.group(3), 16)
+    return chr(code) if code < 0x110000 else None
+
+
+def unescape_url_escapes(literal: str) -> str:
+    """Undo the escapes that hide a URL in a literal (``\\/``, ``\\x2f``, ``\\u002f``),
+    leaving every other escape as written."""
+
+    def replace(match: re.Match[str]) -> str:
+        if match.group(4):
+            return "/"
+        return _code_point(match) or match.group()
+
+    return _URL_ESCAPE.sub(replace, literal)
+
+
+def unescape(literal: str) -> str:
+    """The value of a string literal's body: every JavaScript escape undone."""
+    if "\\" not in literal:
+        return literal
+
+    def replace(match: re.Match[str]) -> str:
+        other = match.group(4)
+        if other is None:
+            return _code_point(match) or match.group()
+        if other in ("\n", "\r", "\r\n", "\u2028", "\u2029"):
+            return ""  # a line continuation
+        return _SINGLE_ESCAPES.get(other, other)
+
+    return _ESCAPE.sub(replace, literal)
+
+
+def string_value(token: Token) -> str:
+    """The value of a string token, or the literal text of a template literal piece."""
+    text = token.text
+    if token.kind is TokenKind.STRING:
+        body = text[1:-1] if len(text) >= 2 and text[-1] == text[0] else text[1:]
+    else:  # a template piece starts with ` or } and ends with ` or ${
+        body = text[1:]
+        if body.endswith("${"):
+            body = body[:-2]
+        elif body.endswith("`"):
+            body = body[:-1]
+    return unescape(body)
+
+
+def urls_in(text: str) -> Iterator[tuple[str, str]]:
+    """``(url, host)`` for each absolute or protocol-relative URL in ``text``.
+
+    Hosts are lowercased without a trailing dot. ``//comment`` or ``a//b`` (no dot in the
+    "host", other than ``localhost`` and IPv6 literals) and out-of-range ports don't count.
+    """
+    if "//" not in text:
+        return
+    for match in URL_PATTERN.finditer(text):
+        host = match.group("host").lower().rstrip(".")
+        if "." not in host and not host.startswith("[") and host != "localhost":
+            continue
+        url = match.group()
+        try:
+            parsed = urlsplit(url if not url.startswith("//") else "https:" + url)
+            parsed.port  # noqa: B018 - raises for an out-of-range port
+        except ValueError:
+            continue
+        yield url, host

