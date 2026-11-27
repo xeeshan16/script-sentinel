@@ -14,6 +14,10 @@ from script_sentinel.db.models import (
     AuthorizationEvent,
     AuthorizationStatus,
     ChangePolicy,
+    CspBlockedKind,
+    CspDisposition,
+    CspReportFormat,
+    CspViolation,
     Decision,
     Finding,
     FindingStatus,
@@ -552,3 +556,74 @@ class DiffOut(BaseModel):
     coarse: bool = Field(description="Parts were compared statement by statement.")
     hunk_count: int
     hunks: list[HunkOut]
+
+
+class CspIngestOut(BaseModel):
+    site: str
+    format: CspReportFormat
+    received: int = Field(description="Reports in the payload.")
+    accepted: int = Field(description="Reports counted towards a violation group.")
+    groups_new: int
+    groups_updated: int
+    dropped: dict[str, int] = Field(
+        description="Reports not counted, by reason: invalid, not_csp, foreign_document, "
+        "extension, batch_limit, group_limit.",
+        examples=[{"extension": 1, "not_csp": 2}],
+    )
+
+
+class CspViolationOut(BaseModel):
+    id: uuid.UUID
+    fingerprint: str
+    document_url: str = Field(description="Origin and path; the query is never stored.")
+    effective_directive: str = Field(examples=["script-src-elem", "connect-src"])
+    blocked: str = Field(examples=["https://collect.evil.test/c", "inline", "data:"])
+    blocked_kind: CspBlockedKind
+    blocked_host: str | None
+    disposition: CspDisposition
+    source_file: str | None
+    line: int | None
+    column: int | None
+    status_code: int | None
+    sample: str | None = Field(description="Up to 40 characters of the offending code.")
+    policy_sha256: str | None
+    report_format: CspReportFormat
+    count: int = Field(description="Reports counted towards this group.")
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+    @classmethod
+    def of(cls, group: CspViolation) -> CspViolationOut:
+        return cls(
+            id=group.id,
+            fingerprint=group.fingerprint,
+            document_url=group.document_url,
+            effective_directive=group.effective_directive,
+            blocked=group.blocked,
+            blocked_kind=group.blocked_kind,
+            blocked_host=group.blocked_host,
+            disposition=group.disposition,
+            source_file=group.source_file,
+            line=group.line,
+            column=group.column,
+            status_code=group.status_code,
+            sample=group.sample,
+            policy_sha256=group.policy_sha256,
+            report_format=group.report_format,
+            count=group.count,
+            first_seen_at=group.first_seen_at,
+            last_seen_at=group.last_seen_at,
+        )
+
+
+class CspViolationDetail(CspViolationOut):
+    original_policy: str | None = Field(
+        description="The policy as first reported (truncated to 4096 characters)."
+    )
+
+
+class CspViolationList(BaseModel):
+    site: str
+    total_groups: int = Field(description="Groups matching the filters, before the limit.")
+    total_reports: int = Field(description="Reports counted towards those groups.")
+    violations: list[CspViolationOut]

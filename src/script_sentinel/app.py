@@ -12,12 +12,14 @@ from sqlalchemy import text
 
 from script_sentinel import __version__
 from script_sentinel.api import authorization as authorization_api
+from script_sentinel.api import csp as csp_api
 from script_sentinel.api import findings as findings_api
 from script_sentinel.api import scans as scans_api
 from script_sentinel.api import sites as sites_api
 from script_sentinel.config import Settings
 from script_sentinel.db import make_engine, make_sessionmaker
 from script_sentinel.fetch import PageFetcher
+from script_sentinel.ratelimit import RateLimiter
 from script_sentinel.sites import ConflictError, NotFoundError, SiteError, ValidationError
 
 _STATUS: dict[type[SiteError], int] = {
@@ -53,6 +55,7 @@ def create_app(
     app.state.settings = settings
     # A fresh fetcher per scan, so each scan reads robots.txt again.
     app.state.fetcher_factory = lambda: PageFetcher(limits, transport=transport)
+    app.state.csp_limiter = RateLimiter(settings.csp_reports_per_minute / 60, settings.csp_burst)
 
     @app.exception_handler(SiteError)
     async def _site_error(_request: Request, exc: SiteError) -> JSONResponse:
@@ -81,4 +84,5 @@ def create_app(
     app.include_router(scans_api.router)
     app.include_router(authorization_api.router)
     app.include_router(findings_api.router)
+    app.include_router(csp_api.router)
     return app

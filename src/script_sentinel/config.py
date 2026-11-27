@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from script_sentinel import __version__
 
 if TYPE_CHECKING:
     from script_sentinel.fetch import FetchLimits
+    from script_sentinel.violations import IngestLimits
 
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://sentinel:sentinel@localhost:5432/sentinel"
 
@@ -63,6 +64,54 @@ class Settings(BaseSettings):
     scan_concurrency: int = Field(
         default=4, ge=1, le=64, description="Pages fetched at once during a scan."
     )
+
+    csp_max_body_bytes: int = Field(
+        default=64 * 1024,
+        ge=1024,
+        le=1024 * 1024,
+        description="Larger CSP report requests are refused with 413 before being parsed.",
+    )
+    csp_max_reports_per_request: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Reports read from one Reporting API batch; the rest count as dropped.",
+    )
+    csp_reports_per_minute: int = Field(
+        default=600,
+        ge=1,
+        le=1_000_000,
+        description="Sustained CSP reports accepted per site per minute (per API process).",
+    )
+    csp_burst: int = Field(
+        default=300,
+        ge=1,
+        le=1_000_000,
+        description="Reports a site may send at once before the rate limit applies.",
+    )
+    csp_max_groups_per_site: int = Field(
+        default=10_000,
+        ge=1,
+        le=10_000_000,
+        description="Distinct violation groups kept per site; new ones beyond it are dropped.",
+    )
+
+    @model_validator(mode="after")
+    def _burst_covers_a_batch(self) -> Settings:
+        if self.csp_burst < self.csp_max_reports_per_request:
+            raise ValueError(
+                "csp_burst must be at least csp_max_reports_per_request, or a full batch "
+                "could never be accepted"
+            )
+        return self
+
+    def ingest_limits(self) -> IngestLimits:
+        from script_sentinel.violations import IngestLimits
+
+        return IngestLimits(
+            max_reports=self.csp_max_reports_per_request,
+            max_groups=self.csp_max_groups_per_site,
+        )
 
     def fetch_limits(self) -> FetchLimits:
         from script_sentinel.fetch import FetchLimits

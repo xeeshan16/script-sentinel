@@ -23,15 +23,19 @@ from script_sentinel import (
     scanner,
     sites,
     versions,
+    violations,
 )
 from script_sentinel.changes import severity_at_least
 from script_sentinel.config import Settings
+from script_sentinel.csp_reports import PayloadError, UnsupportedContentTypeError
 from script_sentinel.db import make_engine, make_sessionmaker
 from script_sentinel.db.models import (
     ApprovalScope,
     AuthorizationEvent,
     AuthorizationStatus,
     ChangePolicy,
+    CspDisposition,
+    CspViolation,
     Finding,
     FindingKind,
     FindingStatus,
@@ -83,6 +87,11 @@ findings_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(findings_app, name="findings")
+csp_app = typer.Typer(
+    help="Load CSP violation reports and review the violation groups they form.",
+    no_args_is_help=True,
+)
+app.add_typer(csp_app, name="csp")
 
 # `sentinel scan run` exits with this when any page could not be inventoried...
 EXIT_SCAN_INCOMPLETE = 3
@@ -1619,3 +1628,213 @@ def findings_reopen(
 ) -> None:
     """Reopen an acknowledged or resolved finding. Audited."""
     _set_finding(finding_id, FindingStatus.OPEN, note, actor, url)
+
+
+_CONTENT_TYPES = {
+    "auto": "application/json",
+    "csp-report": "application/csp-report",
+    "reporting-api": "application/reports+json",
+}
+
+
+@csp_app.command("ingest")
+def csp_ingest(
+    site: str,
+    path: Annotated[
+        str, typer.Argument(metavar="FILE", help="A saved report payload, or - for stdin.")
+    ],
+    report_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            help="auto (by shape), csp-report (report-uri) or reporting-api (report-to).",
+        ),
+    ] = "auto",
+    as_json: JsonOutput = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Load a saved CSP report payload, exactly as the collector would.
+
+    The same validation, normalization and dedupe apply; the rate limit doesn't.
+    """
+    content_type = _CONTENT_TYPES.get(report_format)
+    if content_type is None:
+        typer.secho(
+            f"error: --format is one of {', '.join(_CONTENT_TYPES)}", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=2)
+    settings = Settings()
+    try:
+        body = typer.get_binary_stream("stdin").read() if path == "-" else Path(path).read_bytes()
+    except OSError as exc:
+        typer.secho(f"error: cannot read {path}: {exc.strerror}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    if len(body) > settings.csp_max_body_bytes:
+        typer.secho(
+            f"error: {path} is larger than SENTINEL_CSP_MAX_BODY_BYTES "
+            f"({settings.csp_max_body_bytes} bytes)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    async def work(session: AsyncSession) -> violations.IngestResult:
+        return await violations.ingest_payload(
+            session, site, body, content_type, limits=settings.ingest_limits()
+        )
+
+    try:
+        result = _run(url, work)
+    except (PayloadError, UnsupportedContentTypeError) as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    if as_json:
+        typer.echo(json.dumps(result.to_dict(), indent=2))
+        return
+    typer.echo(
+        f"{result.format.value}: {result.received} received, {result.accepted} accepted "
+        f"({result.groups_new} new groups, {result.groups_updated} updated)"
+    )
+    if result.dropped:
+        reasons = ", ".join(f"{reason} {count}" for reason, count in result.dropped.items())
+        typer.echo(f"  dropped: {reasons}")
+
+
+def _violation_json(group: CspViolation, *, detail: bool = False) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "id": str(group.id),
+        "fingerprint": group.fingerprint,
+        "document_url": group.document_url,
+        "effective_directive": group.effective_directive,
+        "blocked": group.blocked,
+        "blocked_kind": group.blocked_kind.value,
+        "blocked_host": group.blocked_host,
+        "disposition": group.disposition.value,
+        "source_file": group.source_file,
+        "line": group.line,
+        "column": group.column,
+        "status_code": group.status_code,
+        "sample": group.sample,
+        "policy_sha256": group.policy_sha256,
+        "report_format": group.report_format.value,
+        "count": group.count,
+        "first_seen_at": group.first_seen_at.isoformat(),
+        "last_seen_at": group.last_seen_at.isoformat(),
+    }
+    if detail:
+        data["original_policy"] = group.original_policy
+    return data
+
+
+def _location(group: CspViolation) -> str:
+    if group.source_file is None:
+        return f"line {group.line}" if group.line is not None else ""
+    return group.source_file + (f":{group.line}" if group.line is not None else "")
+
+
+@csp_app.command("violations")
+def csp_violations(
+    site: str,
+    directive: Annotated[
+        str | None, typer.Option(help="Only this directive, e.g. script-src-elem.")
+    ] = None,
+    disposition: Annotated[
+        CspDisposition | None,
+        typer.Option(
+            help="enforce (blocked), report (report-only) or unknown.", case_sensitive=False
+        ),
+    ] = None,
+    host: Annotated[str | None, typer.Option("--host", help="Only this blocked host.")] = None,
+    order: Annotated[
+        violations.ViolationOrder,
+        typer.Option("--order", help="last_seen or count.", case_sensitive=False),
+    ] = violations.ViolationOrder.LAST_SEEN,
+    limit: Annotated[int, typer.Option(min=1, max=500, help="How many groups.")] = 50,
+    as_json: JsonOutput = False,
+    url: DatabaseURL = None,
+) -> None:
+    """List a site's CSP violation groups, most recently seen first."""
+
+    async def work(session: AsyncSession) -> violations.ViolationPage:
+        return await violations.list_violations(
+            session,
+            site,
+            directive=directive,
+            disposition=disposition,
+            blocked_host=host,
+            order=order,
+            limit=limit,
+        )
+
+    page = _run(url, work)
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "site": site,
+                    "total_groups": page.total_groups,
+                    "total_reports": page.total_reports,
+                    "violations": [_violation_json(g) for g in page.groups],
+                },
+                indent=2,
+            )
+        )
+        return
+    if not page.groups:
+        typer.echo(f"no CSP violations recorded for {site}")
+        return
+    typer.echo(
+        f"{page.total_groups} groups, {page.total_reports} reports"
+        + (f" (showing {len(page.groups)})" if len(page.groups) < page.total_groups else "")
+    )
+    for g in page.groups:
+        typer.echo(
+            f"{g.count:>6}x  {g.disposition.value:<8} {g.effective_directive:<16} {g.blocked}"
+        )
+        where = _location(g)
+        typer.echo(
+            f"         on {g.document_url}"
+            + (f" from {where}" if where else "")
+            + f"  (last {g.last_seen_at:%Y-%m-%d %H:%M:%S}Z)"
+        )
+        if g.sample:
+            typer.echo(f"         sample: {g.sample}")
+
+
+@csp_app.command("show")
+def csp_show(
+    site: str,
+    violation_id: Annotated[str, typer.Argument(metavar="VIOLATION_ID")],
+    as_json: JsonOutput = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Show one violation group with the policy that was violated."""
+    try:
+        parsed = uuid.UUID(violation_id)
+    except ValueError:
+        typer.secho(f"error: {violation_id!r} is not a violation id", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from None
+
+    async def work(session: AsyncSession) -> CspViolation:
+        return await violations.get_violation(session, site, parsed)
+
+    group = _run(url, work)
+    if as_json:
+        typer.echo(json.dumps(_violation_json(group, detail=True), indent=2))
+        return
+    typer.echo(f"CSP violation {group.id} ({site}): reported {group.count} times")
+    typer.echo(f"  directive:   {group.effective_directive} ({group.disposition.value})")
+    host = f" (host {group.blocked_host})" if group.blocked_host else ""
+    typer.echo(f"  blocked:     {group.blocked} [{group.blocked_kind.value}]{host}")
+    typer.echo(f"  page:        {group.document_url}")
+    where = _location(group)
+    if where:
+        typer.echo(f"  source:      {where}" + (f":{group.column}" if group.column else ""))
+    if group.sample:
+        typer.echo(f"  sample:      {group.sample}")
+    typer.echo(
+        f"  seen:        {group.first_seen_at:%Y-%m-%d %H:%M:%S}Z to "
+        f"{group.last_seen_at:%Y-%m-%d %H:%M:%S}Z (last via {group.report_format.value})"
+    )
+    if group.original_policy:
+        typer.echo(f"  policy:      {group.original_policy}")
