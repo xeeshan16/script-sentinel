@@ -12,7 +12,7 @@ code runs on your checkout page with your users' trust. script-sentinel keeps an
 every script your pages load, pins what each one should look like, and tells you when one
 changes and whether the change looks like a skimmer.
 
-> **Status: in active development (day 6 of 14).** Scans fetch your pages, inventory every
+> **Status: in active development (day 7 of 14).** Scans fetch your pages, inventory every
 > script they load, download and hash every script body, keep a version history per script,
 > check `integrity` attributes the way a browser does, and snapshot each page's security
 > headers. Every script is approved (with a written justification), rejected or pending,
@@ -24,7 +24,9 @@ changes and whether the change looks like a skimmer.
 > injected scripts), see through `atob` and string-joining, and raise the severity; a
 > skimmer already running when monitoring starts is reported instead of becoming the
 > baseline. Decisions, status changes and the handling of findings land in a hash-chained
-> audit trail. See [docs/PLAN.md](docs/PLAN.md)
+> audit trail. A CSP report collector takes both browser report formats, drops noise and
+> other sites' pages, strips personal data from URLs and folds duplicates into counted
+> violation groups behind size and per-site rate limits. See [docs/PLAN.md](docs/PLAN.md)
 > for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for the daily log.
 
 ## Why
@@ -55,7 +57,8 @@ changes and whether the change looks like a skimmer.
 | Change review | Every scan compares each script with what it served last time; a changed body (including going back to an old one) or a script new to an already-scanned page becomes a finding with a severity: a token diff that ignores comments and whitespace and stays fast on minified bundles, size and entropy deltas, and the hosts and URLs the new code references; inline blocks are matched by content, so inserting one doesn't shift the others | ✅ day 5 |
 | Findings | Open, acknowledged or resolved (with a note), each step in the audit trail; `scan run --fail-on SEVERITY` gates a pipeline; `scripts diff` compares any two versions | ✅ day 5 |
 | Skimmer heuristics | Exfiltration sinks (`sendBeacon`, `fetch`, XHR, image pixels, WebSockets, `$.ajax`) and where they send, card-field and form-input collection, cookies and storage, wallet addresses and clipboard swaps, `eval` on decoded text, packers and `_0x` names, injected scripts; literals decoded (`atob`, `fromCharCode`, reversed strings) and joined before the rules run, so hidden hosts count. Verdicts combine signals and only count what a change added; a page's first scan reports a skimmer instead of baselining it; `sentinel inspect FILE` runs offline. Tested on a synthetic corpus of skimmers and benign look-alikes | ✅ day 6 |
-| CSP reports | `report-uri` and Reporting API collector with dedupe, rate limits, batch ingest and optional Kafka | days 7–8 |
+| CSP reports | `report-uri` and Reporting API collector: schema validation, body-size and batch limits, a per-site rate limit charged per report, CORS for the site's own origins; reports normalized (queries, referrers and `data:` bodies never stored), extension noise and foreign pages dropped, duplicates folded into fingerprinted groups with counts | ✅ day 7 |
+| High-volume ingest | Buffered batch inserts with backpressure, optional Kafka, rolling aggregates per directive and blocked host | day 8 |
 | CSP builder | Policy suggestions from the approved inventory and observed reports | day 9 |
 | Worker and alerts | Scheduled scans, advisory locks, transactional outbox, HMAC-signed webhooks | day 10 |
 | Dynamic scripts | Optional headless-browser renderer for runtime-injected scripts | day 11 |
@@ -67,7 +70,7 @@ changes and whether the change looks like a skimmer.
 flowchart LR
     subgraph API["FastAPI service"]
         sites["/v1/sites<br/>registry + allowlist"]
-        csp["CSP report collector<br/>(day 7)"]
+        csp["/v1/reports/csp/{site}<br/>CSP report collector"]
     end
     worker["Scan worker<br/>(day 10)"] --> scanner["Scanner<br/>fetch → parse → hash"]
     scans["/v1/sites/{name}/scans"] --> scanner
@@ -79,7 +82,9 @@ flowchart LR
     findings --> trail
     heur["Skimmer heuristics<br/>sinks · collection · wallets<br/>obfuscation · injection"] --> diff
     sites --> store
-    csp --> ingest["Buffered ingest<br/>(memory or Kafka)"] --> store
+    browsers["Browsers<br/>report-uri · report-to"] --> csp
+    csp --> normalize["Validate · normalize<br/>rate-limit · fingerprint"] --> groups[("CSP violation groups")]
+    normalize -.-> ingest["Buffered ingest<br/>(day 8: memory or Kafka)"]
 ```
 
 The data model today:
@@ -105,6 +110,7 @@ erDiagram
     SITE ||--o{ AUTHORIZATION_EVENT : "audit trail"
     SCAN |o--o{ FINDING : raised
     SCRIPT_VERSION |o--o{ FINDING : "new body / previous body"
+    SITE ||--o{ CSP_VIOLATION : "reports about"
     SITE {
         uuid id
         string name
@@ -182,6 +188,18 @@ erDiagram
         string to_status
         string prev_hash
         string hash "sha256 of the event"
+    }
+    CSP_VIOLATION {
+        string fingerprint "unique per site"
+        string document_url "no query"
+        string effective_directive
+        string blocked "URL, keyword or scheme"
+        string blocked_host
+        enum disposition "enforce | report | unknown"
+        string source_file
+        int line
+        int count
+        datetime last_seen_at
     }
     FINDING {
         string kind "script.added | script.changed | script.reformatted"
@@ -296,6 +314,26 @@ Design notes:
   block after it "changing".
 - **Findings outlive the scripts they're about.** Deleting a script sets the reference on its
   findings to `NULL` instead of deleting them; they are audit evidence.
+- **A report endpoint anyone can reach, bounded everywhere.** Browsers can't authenticate
+  to a CSP endpoint, so the collector limits what it will do for anyone instead: the body
+  is capped (by `Content-Length` and again while streaming, so a missing or understated
+  length doesn't help), compressed bodies are refused, a batch is read up to a cap, and a
+  per-site token bucket is charged per report before anything is written (a rejected
+  request still costs a token, so garbage isn't parsed for free). Reports about documents
+  off the site's allowed origins are dropped, so nobody can fill a site's violation list
+  with someone else's pages, and preflights only succeed for the site's own origins.
+- **Reports keep what's needed to act, nothing else.** Document, blocked and source URLs
+  lose their query, fragment and credentials (they carry order numbers, e-mail addresses
+  and session tokens), `data:` and `blob:` URLs keep only the scheme, samples stop at the
+  40 characters browsers send, and the referrer and user agent are never stored.
+- **Violations are grouped, not logged.** A report's fingerprint covers the page, the
+  directive, what was blocked, the source file and line and the disposition. The column
+  (it moves with every minified build), the sample (attacker-controlled text) and the
+  policy text are left out. Each group is one row updated by a single upsert
+  (`INSERT … ON CONFLICT DO UPDATE` on PostgreSQL and SQLite), so the table grows with
+  distinct problems, not traffic, and a per-site cap stops new groups past
+  `SENTINEL_CSP_MAX_GROUPS_PER_SITE` while existing ones keep counting. The rate limit
+  lives in each API process; a shared limit and buffered ingest come with day 8.
 - **Portable schema.** Enums are `VARCHAR` + `CHECK`, JSON is `JSONB` on PostgreSQL, and
   timestamps are timezone-aware UTC on both PostgreSQL and SQLite. A test asserts the ORM
   models and the hand-written migrations match. SQLite migrations run with foreign keys
@@ -732,6 +770,94 @@ exact verdicts it must get. All of them are inert, and every host is on the rese
 
 (Output from a real run against PostgreSQL 16.)
 
+### Collect CSP reports
+
+Point a policy's reporting at the collector. With the Reporting API (`report-to`):
+
+```http
+Reporting-Endpoints: csp="https://sentinel.example.com/v1/reports/csp/shop"
+Content-Security-Policy-Report-Only: script-src 'self' https://pay.vendor.test; report-to csp; report-uri https://sentinel.example.com/v1/reports/csp/shop
+```
+
+`report-uri` is kept next to `report-to` for browsers that only support the older format.
+Both formats go to the same URL. Sending the two synthetic payloads in
+[`examples/csp-reports/`](examples/csp-reports) to a site registered with
+`https://shop.example.com`:
+
+```console
+$ curl -s -X POST localhost:8080/v1/reports/csp/shop -H 'content-type: application/csp-report' \
+    --data-binary @examples/csp-reports/report-uri.json
+{
+  "site": "shop",
+  "format": "csp-report",
+  "received": 1,
+  "accepted": 1,
+  "groups_new": 1,
+  "groups_updated": 0,
+  "dropped": {}
+}
+$ curl -s -X POST localhost:8080/v1/reports/csp/shop -H 'content-type: application/reports+json' \
+    --data-binary @examples/csp-reports/reporting-api.json
+{
+  "site": "shop",
+  "format": "reporting-api",
+  "received": 6,
+  "accepted": 3,
+  "groups_new": 2,
+  "groups_updated": 0,
+  "dropped": {
+    "not_csp": 1,
+    "foreign_document": 1,
+    "extension": 1
+  }
+}
+```
+
+The batch had a deprecation report sharing the endpoint, a report about another site's
+page and one caused by a browser extension; those were counted and dropped. Two reports of
+the same blocked beacon, differing only in their query strings, became one group:
+
+```console
+$ sentinel csp violations shop --order count
+3 groups, 4 reports
+     2x  enforce  connect-src      https://collect.skim.test/beacon
+         on https://shop.example.com/checkout from https://cdn.vendor.test/analytics/v2/tag.js:1  (last 2026-11-27 10:09:54Z)
+     1x  enforce  script-src-elem  inline
+         on https://shop.example.com/ from https://shop.example.com/:14  (last 2026-11-27 10:09:54Z)
+         sample: window.dataLayer=window.dataLayer||[];fu
+     1x  report   script-src-elem  https://collect.skim.test/c.js
+         on https://shop.example.com/checkout from https://shop.example.com/checkout:1  (last 2026-11-27 10:09:54Z)
+$ sentinel csp show shop a01153ca-1225-4fee-b19e-49011fba283a
+CSP violation a01153ca-1225-4fee-b19e-49011fba283a (shop): reported 2 times
+  directive:   connect-src (enforce)
+  blocked:     https://collect.skim.test/beacon [url] (host collect.skim.test)
+  page:        https://shop.example.com/checkout
+  source:      https://cdn.vendor.test/analytics/v2/tag.js:1:4120
+  seen:        2026-11-27 10:09:54Z to 2026-11-27 10:09:54Z (last via reporting-api)
+  policy:      default-src 'self'; connect-src 'self' https://pay.vendor.test; report-to csp
+```
+
+The card number and e-mail address in the payloads' query strings were never stored.
+Preflights are answered for the site's own origins only:
+
+```console
+$ curl -s -o /dev/null -D - -X OPTIONS localhost:8080/v1/reports/csp/shop \
+    -H 'origin: https://shop.example.com' -H 'access-control-request-method: POST'
+HTTP/1.1 204 No Content
+vary: Origin
+access-control-allow-origin: https://shop.example.com
+access-control-allow-methods: POST
+access-control-allow-headers: content-type
+access-control-max-age: 86400
+```
+
+Over the rate limit the collector answers `429` with `Retry-After` and records nothing;
+a body over `SENTINEL_CSP_MAX_BODY_BYTES` gets `413`, another content type `415`.
+`sentinel csp ingest SITE FILE` replays a saved payload through the same validation and
+grouping (without the rate limit).
+
+(Output from a real run against PostgreSQL 16; the date and server headers are omitted.)
+
 ### The API
 
 Or run the API (interactive docs at `http://127.0.0.1:8080/docs`):
@@ -819,6 +945,9 @@ $ curl -s localhost:8080/v1/sites/demo/audit/verify | jq .
 | `POST` | `/v1/findings/{id}/reopen` | Reopen (`actor`, optional `note`); audited |
 | `GET` | `/v1/sites/{name}/scripts/{id}/diff?from=…&to=…&max_hunks=200` | Token diff between two versions (id, hex SHA-384 prefix or SRI prefix), with the signals the newer one added and the verdicts on them; defaults to the latest two |
 | `GET` | `/v1/sites/{name}/scripts/{id}/inspect?version=…` | Run the skimmer heuristics on a version (default: the latest): signals with evidence, hidden hosts, verdicts and the worst severity; read-only |
+| `POST` | `/v1/reports/csp/{name}` | Collect CSP reports (`application/csp-report` or `application/reports+json`); `202` with what was counted and dropped, `413`, `415`, `400`, or `429` with `Retry-After`. `OPTIONS` answers CORS preflights for the site's own origins |
+| `GET` | `/v1/sites/{name}/csp/violations?directive=…&disposition=…&blocked_host=…&since=…&order=last_seen\|count&limit=50` | Violation groups with totals |
+| `GET` | `/v1/sites/{name}/csp/violations/{id}` | One group, with the violated policy |
 
 `PATCH /v1/sites/{name}` also accepts `respect_robots`. The `actor` on authorization and
 finding requests is recorded as given: the API has no authentication yet (day 13 adds it),
@@ -838,6 +967,11 @@ for now; scheduled background scans arrive with the worker on day 10.
 | `SENTINEL_MAX_SCRIPT_BYTES` | `5242880` | Larger external scripts are reported as `too_large` instead of hashed |
 | `SENTINEL_MAX_REDIRECTS` | `5` | Redirect hops per page or script |
 | `SENTINEL_SCAN_CONCURRENCY` | `4` | Pages fetched at once during a scan |
+| `SENTINEL_CSP_MAX_BODY_BYTES` | `65536` | Larger report requests get `413` (1 KiB to 1 MiB) |
+| `SENTINEL_CSP_MAX_REPORTS_PER_REQUEST` | `100` | Reports read from one batch; the rest are dropped as `batch_limit` |
+| `SENTINEL_CSP_REPORTS_PER_MINUTE` | `600` | Sustained reports accepted per site per minute, per API process |
+| `SENTINEL_CSP_BURST` | `300` | Reports a site may send at once; at least the batch limit |
+| `SENTINEL_CSP_MAX_GROUPS_PER_SITE` | `10000` | Distinct violation groups kept per site; new ones beyond it are dropped as `group_limit` |
 | `SENTINEL_ACTOR` | login name | Who the CLI records in the audit trail (`--actor` overrides it) |
 
 The default URL's credentials are local-development placeholders; set your own in production.
@@ -870,7 +1004,9 @@ script and checks for a `critical` finding with the new host in its diff, exit c
 of the others is one new script. Finally it adds a page that already runs a skimmer and
 checks for a `script.suspicious` finding with the hidden host, and runs `sentinel inspect`
 on the heuristics corpus (a skimmer fails `--fail-on high`, the PSP library given its own
-host passes).
+host passes). The API smoke test posts both example CSP payloads and checks the grouping,
+the drop reasons, that no query string was stored, the preflight for an allowed and a
+foreign origin, `413` and `415`, and a replay through `sentinel csp ingest`.
 
 ## Project layout
 
@@ -899,10 +1035,14 @@ src/script_sentinel/
   scanner.py        runs a scan and records snapshots, fetches, versions and the inventory
   authorization.py  decisions, policies and the rules that derive each script's status
   audit.py          the hash-chained, append-only authorization audit trail
+  csp_reports.py    CSP report schemas, normalization, drop reasons and fingerprints
+  violations.py     folding reports into violation groups (upserts) and listing them
+  ratelimit.py      per-site token bucket for the report collector
 examples/
   serve.py          serves the fixture shop and its CDN on two local origins
   fixture-site/     synthetic shop for the quick start and CI
   fixture-cdn/      the "third-party" scripts it loads
+  csp-reports/      synthetic report-uri and Reporting API payloads
 tests/              pytest suite (SQLite always, PostgreSQL when configured)
   fixtures/heuristics/  synthetic skimmer and benign corpus with expected verdicts
 docs/               PLAN.md and PROGRESS.md

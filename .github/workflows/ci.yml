@@ -107,6 +107,39 @@ jobs:
           status=$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8080/v1/sites/blog/pages \
             -H 'content-type: application/json' -d '{"url": "https://evil.test/"}')
           test "$status" = 422
+          # CSP reports in both formats: grouped across query strings, noise dropped by reason.
+          curl -sf -X POST localhost:8080/v1/reports/csp/shop \
+            -H 'content-type: application/csp-report' \
+            --data-binary @examples/csp-reports/report-uri.json \
+            | jq -e '.format == "csp-report" and .accepted == 1 and .groups_new == 1'
+          curl -sf -X POST localhost:8080/v1/reports/csp/shop \
+            -H 'content-type: application/reports+json' \
+            --data-binary @examples/csp-reports/reporting-api.json \
+            | jq -e '.received == 6 and .accepted == 3 and .groups_new == 2
+                     and .dropped == {"not_csp": 1, "foreign_document": 1, "extension": 1}'
+          curl -sf 'localhost:8080/v1/sites/shop/csp/violations?order=count' \
+            | jq -e '.total_groups == 3 and .total_reports == 4 and .violations[0].count == 2
+                     and .violations[0].blocked == "https://collect.skim.test/beacon"
+                     and (tostring | contains("4111") | not)'
+          # Preflights succeed for the site's own origin only.
+          headers=$(curl -sf -o /dev/null -D - -X OPTIONS localhost:8080/v1/reports/csp/shop \
+            -H 'origin: https://shop.example.com' -H 'access-control-request-method: POST')
+          grep -qi '^access-control-allow-origin: https://shop.example.com' <<< "$headers"
+          headers=$(curl -sf -o /dev/null -D - -X OPTIONS localhost:8080/v1/reports/csp/shop \
+            -H 'origin: https://evil.test')
+          if grep -qi '^access-control-allow-origin' <<< "$headers"; then exit 1; fi
+          # Oversized bodies and other content types are refused.
+          status=$(head -c 70000 /dev/zero | tr '\0' ' ' | curl -s -o /dev/null -w '%{http_code}' \
+            -X POST localhost:8080/v1/reports/csp/shop -H 'content-type: application/csp-report' \
+            --data-binary @-)
+          test "$status" = 413
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8080/v1/reports/csp/shop \
+            -H 'content-type: text/plain' -d '{}')
+          test "$status" = 415
+          # The CLI replays a saved payload through the same pipeline.
+          .venv/bin/sentinel csp ingest shop examples/csp-reports/reporting-api.json --json \
+            | jq -e '.groups_new == 0 and .groups_updated == 2'
+          .venv/bin/sentinel csp violations shop --json | jq -e '.total_reports == 7'
 
       - name: Smoke test a scan against the fixture site
         env:

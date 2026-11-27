@@ -529,3 +529,93 @@ synthetic malicious fixtures, feeding the finding's severity.
 
 **Next (day 7):** the CSP report collector. `report-uri` and Reporting API formats, schema
 validation, size limits, per-site rate limits, dedupe and fingerprinting.
+
+## Day 7 — 2026-11-27: CSP report collector
+
+**Done**
+
+- `csp_reports.py`: pure parsing for both browser formats.
+  - `report-uri` (`application/csp-report`, `{"csp-report": {…}}`, CSP Level 2 names) and
+    the Reporting API (`application/reports+json`, a batch in which only `csp-violation`
+    entries count). `application/json` is accepted for either, by shape; a shape that
+    contradicts the content type is refused rather than guessed at.
+  - Pydantic schemas per report with lax types (`"12"` is a line number), length caps and
+    `extra="ignore"`. One bad report in a batch is counted, not fatal.
+  - Normalization: document, blocked and source URLs keep only origin and path (no query,
+    fragment or credentials; lowercased host, IDNA, default port dropped, IPv6 bracketed);
+    `data:`/`blob:` and other opaque or authority-less schemes keep only the scheme, and
+    old browsers' bare `data` becomes `data:`; keywords (`inline`, `eval`, `wasm-eval`,
+    `trusted-types-*`, `self`) are kept as such; the directive comes from
+    `effective-directive`, falling back to the first token of `violated-directive`; a
+    missing disposition is `unknown`; samples are cut to 40 characters and stripped of
+    control characters; the policy is kept up to 4096 characters and hashed in full. The
+    referrer and user agent are never kept.
+  - Drop reasons: `invalid`, `not_csp`, `foreign_document` (the page isn't on the site's
+    allowed origins), `extension` (blocked or source URL in a browser extension),
+    `batch_limit` and `group_limit`.
+  - `Violation.fingerprint()`: SHA-256 over page, directive, blocked kind and value,
+    source file, line and disposition. Column, sample and policy text are left out on
+    purpose (minified builds move columns; samples are attacker-controlled).
+- `violations.py` and migration `0006`: a `csp_violations` table with one row per
+  (site, fingerprint), `count`, `first_seen_at`/`last_seen_at`, the format of the latest
+  report, and `blocked_host` ready for day 8's aggregates. A request's reports are folded
+  in memory, then written with one `INSERT … ON CONFLICT DO UPDATE` per request (the same
+  statement on PostgreSQL and SQLite). A per-site cap on groups (default 10,000) drops
+  reports that would open a new group while known groups keep counting. Listing with
+  filters (directive, disposition, blocked host, since), two orders and totals.
+- `ratelimit.py`: a keyed token bucket (injectable clock), charged per report; a refused
+  request takes nothing and gets the wait time.
+- API (`api/csp.py`):
+  - `POST /v1/reports/csp/{site}` answers `202` with received/accepted/new/updated and
+    drop counts. `413` from `Content-Length` and again while streaming (a missing or
+    understated length doesn't help), `415` for other content types or a compressed body,
+    `400` for a body that isn't a report payload, `429` with `Retry-After` when over the
+    limit. The bucket is charged before any write, and a rejected request still costs one
+    token. `404` for an unknown site.
+  - `OPTIONS` on the same path answers CORS preflights (Reporting API deliveries need
+    them) with `Access-Control-Allow-Origin` only for the site's own origins.
+  - `GET /v1/sites/{site}/csp/violations` and `…/violations/{id}` (with the policy).
+- Settings: `SENTINEL_CSP_MAX_BODY_BYTES` (64 KiB), `…_MAX_REPORTS_PER_REQUEST` (100),
+  `…_REPORTS_PER_MINUTE` (600), `…_BURST` (300, must cover a full batch),
+  `…_MAX_GROUPS_PER_SITE` (10,000).
+- CLI: `sentinel csp ingest SITE FILE|- [--format] [--json]` replays a saved payload
+  through the same pipeline (no rate limit), `sentinel csp violations` and
+  `sentinel csp show`.
+- `examples/csp-reports/`: a synthetic `report-uri` payload and a Reporting API batch (two
+  reports of one beacon differing only in query strings, an inline violation, extension
+  noise, another site's page, a deprecation report). All hosts are on `.test` or
+  `example.com`.
+- CI: the API smoke test posts both payloads and checks the grouping, the drop reasons,
+  that no query string was stored, preflights for an allowed and a foreign origin, `413`
+  and `415`, and a CLI replay.
+- README: a "Collect CSP reports" walkthrough recorded from a real run against
+  PostgreSQL 16, the new endpoints, settings, data model and design notes.
+
+**Tests**
+
+- 709 tests locally on Python 3.13 against SQLite and PostgreSQL 16 (167 new), 100% line
+  and branch coverage. Ruff and mypy (strict) are clean; the package builds.
+- New: `test_csp_reports.py` (URL stripping and what it refuses, blocked values, directives,
+  extensions, content types and shapes, every drop reason, truncation and full-policy
+  hashing, what a fingerprint ignores and what it tells apart, the example payloads, batch
+  limits); `test_violations.py` (upserts and counters, timestamps on conflict, format of the
+  latest report, the group cap, site isolation, filters and ordering, cascade on site
+  delete); `test_ratelimit.py`; `test_api_csp.py` (both payloads end to end, filters, 404s,
+  413 by length and by stream, 415, 400, rate limiting per report, batch caps, the token a
+  refused request costs, CORS for allowed and foreign origins); `test_cli_csp.py`.
+- The CI smoke step was run locally against PostgreSQL 16 before pushing.
+
+**Known limitations (deliberate for now)**
+
+- The rate limit lives in each API process. With several replicas each enforces it on
+  its own share; a shared limit belongs with day 8's ingest path.
+- Reports are written inside the request. Day 8 adds the buffered batch path with
+  backpressure and optional Kafka.
+- The group cap is checked per request, so concurrent requests can overshoot it by a few
+  groups.
+- Report endpoints are unauthenticated by nature; anyone can post plausible reports about
+  a site's own pages. The limits bound the cost, and counts are signals, not evidence.
+
+**Next (day 8):** high-volume ingest. A buffered batch-insert path with backpressure and
+optional Kafka (aiokafka) behind an interface, and rolling aggregates per directive and
+blocked host.

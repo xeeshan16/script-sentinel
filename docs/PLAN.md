@@ -10,7 +10,7 @@ One milestone per day, starting 2026-11-21. Progress is logged in [PROGRESS.md](
 | 4 | **Authorization workflow (6.4.3):** approve or justify each script, with policies: allowlisted origins, pinned hashes, and "expected to change" vendors. REST API and audit trail. | done |
 | 5 | **Change detection and diff:** a JS-aware tokenized diff, size and entropy deltas, and new domains or URLs referenced. Findings get a severity. | done |
 | 6 | **Skimmer heuristics:** new exfiltration sinks (fetch, XHR, sendBeacon, image or WebSocket to a new host), listeners on card or form fields, wallet-address regexes and swaps, eval/atob/obfuscation, and scripts that inject other scripts. Uses a corpus of synthetic malicious fixtures. | done |
-| 7 | **CSP report collector:** `report-uri` and Reporting API formats, schema validation, size limits, per-site rate limits, dedupe and fingerprinting. | |
+| 7 | **CSP report collector:** `report-uri` and Reporting API formats, schema validation, size limits, per-site rate limits, dedupe and fingerprinting. | done |
 | 8 | **High-volume ingest:** a buffered batch-insert path with backpressure and optional Kafka (aiokafka) behind an interface. Rolling aggregates per directive and blocked host. | |
 | 9 | **CSP builder:** suggests a policy from the approved inventory plus the reports seen, compares report-only with the enforced policy, and gives a rollout checklist. | |
 | 10 | **Worker and alerts:** per-site scan schedules (at most every 7 days by default), Postgres advisory locks, retries with backoff, and a transactional outbox with HMAC-signed webhooks (Slack-compatible payload). | |
