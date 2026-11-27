@@ -19,6 +19,9 @@
   severity.
 * A **script fetch** is one download of an external script during a scan: what came back
   and which version it was.
+* A **CSP violation** is one group of Content-Security-Policy violation reports browsers
+  sent about a site's pages: the same page, directive, blocked resource, source location
+  and disposition, with how often it was reported and when (see csp_reports.py).
 * A **scan** is one pass over a site's pages. Each page it fetched gets a **page
   snapshot** (what happened and when), and each script found on that page gets a **script
   observation** with the attributes it had at that moment. Snapshots are kept even after a
@@ -194,6 +197,25 @@ class ScriptType(enum.StrEnum):
     CLASSIC = "classic"
     MODULE = "module"
     IMPORTMAP = "importmap"
+
+
+class CspReportFormat(enum.StrEnum):
+    CSP_REPORT = "csp-report"  # report-uri
+    REPORTING_API = "reporting-api"  # report-to
+
+
+class CspDisposition(enum.StrEnum):
+    ENFORCE = "enforce"  # the browser blocked it
+    REPORT = "report"  # Content-Security-Policy-Report-Only: it ran
+    UNKNOWN = "unknown"  # old browsers leave the field out
+
+
+class CspBlockedKind(enum.StrEnum):
+    URL = "url"  # an http(s) or ws(s) resource: origin and path
+    KEYWORD = "keyword"  # inline, eval, wasm-eval, …
+    SCHEME = "scheme"  # data:, blob:, … (the scheme only)
+    NONE = "none"  # the browser sent nothing
+    OTHER = "other"  # anything else, truncated
 
 
 def _enum(cls: type[enum.StrEnum], name: str, length: int = 16) -> Enum:
@@ -602,6 +624,46 @@ class AuthorizationEvent(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     prev_hash: Mapped[str] = mapped_column(String(64))
     hash: Mapped[str] = mapped_column(String(64))
+
+
+class CspViolation(Base):
+    """A group of identical CSP violation reports, counted rather than stored one by one.
+
+    ``fingerprint`` is the group's identity (see ``csp_reports.Violation.fingerprint``).
+    The other columns describe the group as first reported; ``count`` and
+    ``last_seen_at`` move with every report. URLs are kept without their query or fragment.
+    """
+
+    __tablename__ = "csp_violations"
+    __table_args__ = (
+        UniqueConstraint("site_id", "fingerprint", name="uq_csp_violations_site_fingerprint"),
+        Index("ix_csp_violations_site_last_seen", "site_id", "last_seen_at"),
+        CheckConstraint("count >= 1", name="ck_csp_violations_count"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    site_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    document_url: Mapped[str] = mapped_column(String(2048))
+    effective_directive: Mapped[str] = mapped_column(String(64))
+    blocked: Mapped[str] = mapped_column(String(2048))
+    blocked_kind: Mapped[CspBlockedKind] = mapped_column(_enum(CspBlockedKind, "csp_blocked_kind"))
+    blocked_host: Mapped[str | None] = mapped_column(String(255))
+    disposition: Mapped[CspDisposition] = mapped_column(_enum(CspDisposition, "csp_disposition"))
+    source_file: Mapped[str | None] = mapped_column(String(2048))
+    line: Mapped[int | None] = mapped_column(Integer)
+    column: Mapped[int | None] = mapped_column(Integer)
+    status_code: Mapped[int | None] = mapped_column(Integer)
+    sample: Mapped[str | None] = mapped_column(String(64))
+    original_policy: Mapped[str | None] = mapped_column(Text)
+    policy_sha256: Mapped[str | None] = mapped_column(String(64))
+    # The format of the most recent report.
+    report_format: Mapped[CspReportFormat] = mapped_column(
+        _enum(CspReportFormat, "csp_report_format")
+    )
+    count: Mapped[int] = mapped_column(Integer, default=1)
+    first_seen_at: Mapped[datetime] = mapped_column(default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
 def sri_from_sha384_hex(hex_digest: str) -> str:

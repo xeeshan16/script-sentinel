@@ -1,0 +1,92 @@
+[
+  {
+    "type": "csp-violation",
+    "age": 812,
+    "url": "https://shop.example.com/checkout",
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) Example/1.0",
+    "body": {
+      "documentURL": "https://shop.example.com/checkout",
+      "referrer": "",
+      "effectiveDirective": "connect-src",
+      "originalPolicy": "default-src 'self'; connect-src 'self' https://pay.vendor.test; report-to csp",
+      "sourceFile": "https://cdn.vendor.test/analytics/v2/tag.js",
+      "sample": "",
+      "disposition": "enforce",
+      "statusCode": 200,
+      "lineNumber": 1,
+      "columnNumber": 4120,
+      "blockedURL": "https://collect.skim.test/beacon?c=4111"
+    }
+  },
+  {
+    "type": "csp-violation",
+    "age": 1530,
+    "url": "https://shop.example.com/checkout",
+    "user_agent": "Mozilla/5.0 (Macintosh) Example/2.0",
+    "body": {
+      "documentURL": "https://shop.example.com/checkout?step=2",
+      "effectiveDirective": "connect-src",
+      "originalPolicy": "default-src 'self'; connect-src 'self' https://pay.vendor.test; report-to csp",
+      "sourceFile": "https://cdn.vendor.test/analytics/v2/tag.js?cb=99",
+      "disposition": "enforce",
+      "statusCode": 200,
+      "lineNumber": 1,
+      "columnNumber": 4120,
+      "blockedURL": "https://collect.skim.test/beacon?c=5500"
+    }
+  },
+  {
+    "type": "csp-violation",
+    "age": 40,
+    "url": "https://shop.example.com/",
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) Example/1.0",
+    "body": {
+      "documentURL": "https://shop.example.com/",
+      "effectiveDirective": "script-src-elem",
+      "originalPolicy": "default-src 'self'; script-src 'self'; report-to csp",
+      "sourceFile": "https://shop.example.com/",
+      "sample": "window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments)}",
+      "disposition": "enforce",
+      "statusCode": 200,
+      "lineNumber": 14,
+      "columnNumber": 9,
+      "blockedURL": "inline"
+    }
+  },
+  {
+    "type": "csp-violation",
+    "age": 75,
+    "url": "https://shop.example.com/",
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) Example/1.0",
+    "body": {
+      "documentURL": "https://shop.example.com/",
+      "effectiveDirective": "script-src-elem",
+      "originalPolicy": "default-src 'self'; script-src 'self'; report-to csp",
+      "disposition": "enforce",
+      "statusCode": 200,
+      "blockedURL": "chrome-extension://abcdefghijklmnop/inject.js"
+    }
+  },
+  {
+    "type": "csp-violation",
+    "age": 90,
+    "url": "https://mirror.other.test/",
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) Example/1.0",
+    "body": {
+      "documentURL": "https://mirror.other.test/",
+      "effectiveDirective": "img-src",
+      "disposition": "enforce",
+      "blockedURL": "https://pixel.other.test/p.gif"
+    }
+  },
+  {
+    "type": "deprecation",
+    "age": 120,
+    "url": "https://shop.example.com/",
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) Example/1.0",
+    "body": {
+      "id": "ExampleDeprecatedFeature",
+      "message": "A synthetic deprecation report sharing the endpoint."
+    }
+  }
+]

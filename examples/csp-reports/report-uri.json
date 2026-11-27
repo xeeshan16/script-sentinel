@@ -1,0 +1,16 @@
+{
+  "csp-report": {
+    "document-uri": "https://shop.example.com/checkout?order=1001&email=jane%40example.com",
+    "referrer": "https://shop.example.com/cart",
+    "violated-directive": "script-src-elem",
+    "effective-directive": "script-src-elem",
+    "original-policy": "script-src 'self' https://pay.vendor.test 'nonce-demo'; report-uri /v1/reports/csp/shop",
+    "disposition": "report",
+    "blocked-uri": "https://collect.skim.test/c.js?v=7",
+    "line-number": 1,
+    "column-number": 1840,
+    "source-file": "https://shop.example.com/checkout?order=1001",
+    "status-code": 200,
+    "script-sample": ""
+  }
+}

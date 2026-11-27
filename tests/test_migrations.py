@@ -27,6 +27,7 @@ TABLES = {
     "script_fetches",
     "policies",
     "authorization_events",
+    "csp_violations",
 }
 
 
@@ -72,7 +73,7 @@ def test_upgrade_and_downgrade_round_trip(database_url: str) -> None:
 
 def test_current_prints_the_revision(sqlite_url: str, capsys: pytest.CaptureFixture[str]) -> None:
     migrate.current(sqlite_url)
-    assert "0005" in capsys.readouterr().out
+    assert "0006" in capsys.readouterr().out
 
 
 def _counts(database_url: str) -> dict[str, int]:
