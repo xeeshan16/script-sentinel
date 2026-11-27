@@ -41,7 +41,10 @@ def get_settings(request: Request) -> Settings:
     return settings
 
 
-Session = Annotated[AsyncSession, Depends(get_session)]
+# scope="function" commits before the response is sent. With the default ("request") the
+# commit runs after the client already has its answer: a follow-up request could miss the
+# row it was just told about, and a failed commit would hide behind a 2xx.
+Session = Annotated[AsyncSession, Depends(get_session, scope="function")]
 AppSettings = Annotated[Settings, Depends(get_settings)]
 
 

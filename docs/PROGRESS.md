@@ -590,10 +590,17 @@ validation, size limits, per-site rate limits, dedupe and fingerprinting.
   and `415`, and a CLI replay.
 - README: a "Collect CSP reports" walkthrough recorded from a real run against
   PostgreSQL 16, the new endpoints, settings, data model and design notes.
+- Fix: the first push of the day went red on Python 3.12. The smoke test created a site
+  through the API and got `404` for it on the very next request. The request session was
+  a FastAPI dependency with the default `"request"` scope, whose cleanup (the commit) runs
+  after the response has been sent, so a client could act on a `201` before the row was
+  committed, and a failed commit would have been hidden behind a success. The session
+  now uses `scope="function"` (FastAPI ≥ 0.121), which commits before the response goes
+  out; a test records the order of the commit and the response start.
 
 **Tests**
 
-- 709 tests locally on Python 3.13 against SQLite and PostgreSQL 16 (167 new), 100% line
+- 711 tests locally on Python 3.13 against SQLite and PostgreSQL 16 (169 new), 100% line
   and branch coverage. Ruff and mypy (strict) are clean; the package builds.
 - New: `test_csp_reports.py` (URL stripping and what it refuses, blocked values, directives,
   extensions, content types and shapes, every drop reason, truncation and full-policy

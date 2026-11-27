@@ -3,7 +3,10 @@ from __future__ import annotations
 import uuid
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import SessionTransaction
+from starlette.types import Message, Receive, Scope, Send
 
 from script_sentinel.app import create_app
 from script_sentinel.config import Settings
@@ -257,3 +260,37 @@ def test_scans_use_the_injected_transport(database_url: str) -> None:
         client.post("/v1/sites/shop/pages", json={"url": SHOP + "/"})
         scan = client.post("/v1/sites/shop/scans").json()
     assert scan["pages"][0]["scripts"][0]["locator"] == SHOP + "/#inline-1"
+
+
+def test_the_transaction_commits_before_the_response_is_sent(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client told "created" can read the row back right away, and a failed commit
+    can't hide behind a 2xx that was already sent."""
+    events: list[str] = []
+    commit = SessionTransaction.commit
+
+    def recording_commit(self: SessionTransaction, _to_root: bool = False) -> None:
+        events.append("commit")
+        commit(self, _to_root)
+
+    app = create_app(Settings(database_url=database_url))
+
+    async def recorder(scope: Scope, receive: Receive, send: Send) -> None:
+        async def recording_send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                events.append("response")
+            await send(message)
+
+        await app(scope, receive, recording_send)
+
+    monkeypatch.setattr(SessionTransaction, "commit", recording_commit)
+    with TestClient(recorder) as client:
+        events.clear()
+        response = client.post(
+            "/v1/sites", json={"name": "shop", "allowed_origins": ["https://shop.example.com"]}
+        )
+        assert response.status_code == 201
+        # A flush commits an inner subtransaction; the outer commit must also come first.
+        assert "commit" in events
+        assert events[-1] == "response"
