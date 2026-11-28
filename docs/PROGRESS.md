@@ -626,3 +626,119 @@ validation, size limits, per-site rate limits, dedupe and fingerprinting.
 **Next (day 8):** high-volume ingest. A buffered batch-insert path with backpressure and
 optional Kafka (aiokafka) behind an interface, and rolling aggregates per directive and
 blocked host.
+
+## Day 8 — 2026-11-28: high-volume ingest
+
+**Done**
+
+- One batch writer for every path (`violations.write_batch`). It takes pending batches
+  (site, time accepted, violations) from any number of requests and merges them in memory
+  first, so each distinct group costs one row in one upsert, and so does each rollup key.
+  First-seen keeps the earliest and last-seen the latest, and the format shown follows the
+  newest report (`LEAST`/`GREATEST` on PostgreSQL, SQLite's scalar `min`/`max`), so a late
+  batch from a retried flush or a lagging consumer doesn't rewind anything. Inserts are
+  chunked at 500 rows. Reports for a site deleted in the meantime are counted as
+  `site_gone`. The per-site group cap applies per batch.
+- Hourly rollups (migration `0007`, `csp_rollups`): accepted reports per UTC hour,
+  directive, blocked key (the host for URLs; the keyword or scheme otherwise, such as
+  `inline`, `eval` or `data:`) and disposition. Only reports that made it into a group are
+  rolled up, so the group cap bounds this table too.
+  - `violations.rollup()`: the last N whole hours by directive, blocked key or both, each
+    with its count in the window before and a `new` flag, totals for both windows and a
+    gap-free hourly series. `prune_rollups()` for retention.
+  - `GET /v1/sites/{site}/csp/rollups`, `sentinel csp rollups` (with a sparkline) and
+    `sentinel csp prune`.
+- Ingest modes (`ingest.py`, `SENTINEL_CSP_INGEST_MODE`):
+  - `direct` (the default) is the day 7 behaviour, now through the batch writer.
+  - `buffered`: `BufferedSink` appends to an in-process buffer and answers at once. A
+    background task flushes every interval, or early once `flush_at` reports are waiting.
+    It is bounded: past `max_pending` the collector answers `503` with `Retry-After`. A
+    failed flush puts its batch back in front, in order, and retries with exponential
+    backoff (up to 60 s), so a database outage becomes `503`s instead of lost reports.
+    Rollup pruning runs with the flushes, at most hourly.
+  - `kafka`: `QueueSink` publishes each request's reports as one JSON message keyed by
+    site and answers once the broker has acknowledged it (`acks=all`, idempotent
+    producer); a broker failure or timeout is a `503`. `ReportConsumer` applies messages:
+    per batch, in one transaction, it makes sure each partition has a row in
+    `ingest_offsets`, locks them (`SELECT … FOR UPDATE`), skips records below the stored
+    offset, writes the rest and moves the offsets on. Only then does it commit to the
+    broker, and a failed commit is just logged. On every partition assignment it seeks to
+    the stored offsets. A batch that fails to apply is retried from the stored offsets
+    with backoff. Unreadable messages are logged and skipped, with their offsets stored.
+  - Behind two small protocols, `Publisher` and `Subscriber`. `kafka.py` implements them
+    with aiokafka (a new optional extra, `script-sentinel[kafka]`); `MemoryBroker`
+    implements them in memory with per-group committed offsets.
+  - `sentinel csp consume [--idle-exit N] [--batch N]` runs the consumer until SIGINT or
+    SIGTERM.
+  - `GET /v1/csp/ingest` shows the process's mode and its sink's counters (pending,
+    flushes, written, dropped by reason, refused, last error; or published and failures).
+  - The collector's response says which mode answered. `groups_new` and `groups_updated`
+    are `null` when the reports were queued.
+- Settings: `SENTINEL_CSP_INGEST_MODE`, `…_BUFFER_MAX_REPORTS` (50,000),
+  `…_FLUSH_REPORTS` (1,000), `…_FLUSH_INTERVAL_SECONDS` (1), `…_ROLLUP_RETENTION_DAYS`
+  (62), `SENTINEL_KAFKA_BOOTSTRAP_SERVERS`, `…_TOPIC`, `…_CONSUMER_GROUP` and
+  `…_SEND_TIMEOUT_SECONDS`, with validation (kafka mode needs brokers; the buffer must
+  hold a flush and a full request).
+- `examples/csp_load.py`: a load generator that sends synthetic Reporting API batches
+  (hosts on `.test`) with N concurrent connections and prints what came back.
+- Fix: a deadlock that the load generator found. With 32 concurrent requests in direct
+  mode on PostgreSQL, 684 of 2,000 requests failed with `500` ("deadlock detected"):
+  requests whose upserts touched the same group or rollup rows in different orders locked
+  them in different orders. The day 7 upsert had the same problem; the rollups made it
+  much more likely. Rows are now written in key order, so writers queue instead of
+  deadlocking. A PostgreSQL test runs ten writers whose batches overlap in opposite orders;
+  it failed three runs out of three without the fix.
+- Fix: shutting down the buffered sink cancelled the flusher, so a flush in progress lost
+  its batch (the transaction rolled back and the batch was already out of the buffer).
+  The Python 3.12 run of the load-generator test caught it. Now `close()` asks the flusher
+  to stop and waits for it. A flush stuck past `stop_timeout` is still cancelled, but its
+  batch goes back into the buffer for the final write.
+- One local load run per mode (2,000 requests × 20 reports, 32 connections, one uvicorn
+  process, PostgreSQL 16 and the generator on the same 2-vCPU machine): direct 27.0 s
+  (1,482 reports/s), buffered 12.8 s (3,132 reports/s), every request `202`, all 40,000
+  reports written in both. Before the deadlock fix, direct took 491 s with 684 `500`s.
+  These are single runs on a small shared machine, recorded as measured.
+- CI: a Kafka 3.9 service container. The real-broker tests run against it, and a new smoke
+  step sends 10,000 reports to a buffered collector (all written and rolled up) and runs a
+  payload through kafka mode and `sentinel csp consume` twice (written once, nothing
+  reread).
+- README: the ingest modes with real output, rollups, the load numbers and how they were
+  taken, the new endpoints and settings, design notes, and the updated diagrams.
+
+**Tests**
+
+- 803 tests pass locally on Python 3.13 and on 3.12, against SQLite and PostgreSQL 16 (92
+  new), with 100% line and branch coverage on 3.13. Ruff and mypy (strict) are clean. The
+  real-broker Kafka test is skipped locally (no broker in this environment) and runs in CI.
+- New: `test_rollups.py` (merging across requests, first/last seen and format under
+  out-of-order batches, the group cap per site and its effect on rollups, deleted sites,
+  chunking past 1,000 rows, window queries by each dimension with filters, empty windows,
+  pruning and cascade, and the concurrent-writers deadlock test on PostgreSQL);
+  `test_ingest.py` (the message format and what it refuses; the buffered sink's size and
+  interval flushes, backpressure, failed flushes kept in order with backoff, a flush in
+  progress at shutdown, a stuck one cancelled without loss, pruning; the queue sink; the
+  consumer's offsets across redelivery after a failed broker commit, a failed batch, poison
+  messages and separate groups); `test_api_ingest.py` (each mode through the API, `503`
+  with `Retry-After` and CORS, the status endpoint, shutdown flushing, kafka mode through
+  the in-memory broker and the consumer, settings validation, the load generator against
+  the buffered collector); `test_cli_ingest.py`; `test_kafka.py` (the adapters against a
+  stand-in for aiokafka, and the real-broker round trip in CI).
+- The buffered part of the new CI smoke step was run locally against PostgreSQL 16. The
+  kafka part could only be checked in CI.
+
+**Known limitations (deliberate for now)**
+
+- What is still in the buffer when a buffered process is killed is lost; kafka mode is
+  the durable option.
+- The kafka mode API needs the broker at startup (the producer connects on boot).
+- If a consumer's transaction commits and the process dies before the broker commit, the
+  batch is reread and skipped, not recounted. But a batch cancelled in the middle of its
+  database commit in buffered mode goes back into the buffer, and if that commit had in
+  fact landed, it would be counted twice. That needs a stuck commit and a shutdown at the
+  same moment.
+- The rate limit is still per process; with several API replicas each enforces its own
+  share.
+
+**Next (day 9):** the CSP builder. Suggest a policy from the approved script inventory and
+the reports seen, compare report-only with the enforced policy, and give a rollout
+checklist.

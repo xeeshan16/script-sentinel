@@ -36,9 +36,22 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      kafka:
+        # Single-node KRaft broker advertising localhost:9092 (the image's defaults).
+        image: apache/kafka:3.9.0
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 15
+          --health-start-period 10s
     env:
-      # Runs the SQLite tests plus the same suite against real PostgreSQL.
+      # Runs the SQLite tests plus the same suite against real PostgreSQL, and the Kafka
+      # adapters against a real broker.
       SENTINEL_TEST_DATABASE_URL: postgresql+asyncpg://sentinel:sentinel@localhost:5432/sentinel
+      SENTINEL_TEST_KAFKA_BOOTSTRAP: localhost:9092
     steps:
       - uses: actions/checkout@v4
 
@@ -140,6 +153,59 @@ jobs:
           .venv/bin/sentinel csp ingest shop examples/csp-reports/reporting-api.json --json \
             | jq -e '.groups_new == 0 and .groups_updated == 2'
           .venv/bin/sentinel csp violations shop --json | jq -e '.total_reports == 7'
+
+      - name: Smoke test buffered and Kafka ingest
+        env:
+          SENTINEL_DATABASE_URL: ${{ env.SENTINEL_TEST_DATABASE_URL }}
+          # The load below is one site's worth; keep the rate limit out of the way.
+          SENTINEL_CSP_REPORTS_PER_MINUTE: "1000000"
+          SENTINEL_CSP_BURST: "1000000"
+        run: |
+          .venv/bin/sentinel db downgrade base
+          .venv/bin/sentinel db upgrade
+          .venv/bin/sentinel sites add shop --origin https://shop.example.com
+          ready() {
+            for _ in $(seq 1 30); do curl -sf "localhost:$1/readyz" >/dev/null && return 0; sleep 1; done
+            return 1
+          }
+          # Buffered: answered at once, written by the background flusher in batches.
+          SENTINEL_CSP_INGEST_MODE=buffered .venv/bin/sentinel serve --port 8081 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          ready 8081
+          .venv/bin/python examples/csp_load.py --url http://127.0.0.1:8081 \
+            --requests 500 --batch 20 --concurrency 16 | tee /dev/stderr \
+            | jq -e '.status == {"202": 500}'
+          for _ in $(seq 1 20); do
+            curl -sf localhost:8081/v1/csp/ingest | jq -e '.written == 10000' >/dev/null && break
+            sleep 0.5
+          done
+          curl -sf localhost:8081/v1/csp/ingest \
+            | jq -e '.mode == "buffered" and .pending == 0 and .written == 10000
+                     and .failed_flushes == 0 and .refused == 0'
+          curl -sf localhost:8081/v1/sites/shop/csp/violations | jq -e '.total_reports == 10000'
+          curl -sf 'localhost:8081/v1/sites/shop/csp/rollups?by=blocked&limit=100' \
+            | jq -e '.total == 10000 and (.rows | length) == 50 and all(.rows[]; .new)'
+          .venv/bin/sentinel csp rollups shop --by directive
+          kill "$server"
+          wait "$server" || true
+          # Kafka: the collector publishes once the broker has the reports; the consumer
+          # writes them, and a second run rereads and double-counts nothing.
+          docker exec ${{ job.services.kafka.id }} /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 --create --topic ci-csp --partitions 3
+          export SENTINEL_KAFKA_BOOTSTRAP_SERVERS=localhost:9092 SENTINEL_KAFKA_TOPIC=ci-csp
+          SENTINEL_CSP_INGEST_MODE=kafka .venv/bin/sentinel serve --port 8082 &
+          server=$!
+          ready 8082
+          curl -sf -X POST localhost:8082/v1/reports/csp/shop \
+            -H 'content-type: application/reports+json' \
+            --data-binary @examples/csp-reports/reporting-api.json \
+            | jq -e '.mode == "kafka" and .accepted == 3 and .groups_new == null'
+          curl -sf localhost:8082/v1/csp/ingest | jq -e '.published == 3 and .failures == 0'
+          .venv/bin/sentinel csp consume --idle-exit 20 --json | tee /dev/stderr \
+            | jq -e '.messages == 1 and .written == 3 and .duplicates == 0'
+          .venv/bin/sentinel csp consume --idle-exit 10 --json | jq -e '.messages == 0'
+          curl -sf localhost:8082/v1/sites/shop/csp/violations | jq -e '.total_reports == 10003'
 
       - name: Smoke test a scan against the fixture site
         env:

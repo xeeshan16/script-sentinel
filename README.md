@@ -12,7 +12,7 @@ code runs on your checkout page with your users' trust. script-sentinel keeps an
 every script your pages load, pins what each one should look like, and tells you when one
 changes and whether the change looks like a skimmer.
 
-> **Status: in active development (day 7 of 14).** Scans fetch your pages, inventory every
+> **Status: in active development (day 8 of 14).** Scans fetch your pages, inventory every
 > script they load, download and hash every script body, keep a version history per script,
 > check `integrity` attributes the way a browser does, and snapshot each page's security
 > headers. Every script is approved (with a written justification), rejected or pending,
@@ -26,7 +26,10 @@ changes and whether the change looks like a skimmer.
 > baseline. Decisions, status changes and the handling of findings land in a hash-chained
 > audit trail. A CSP report collector takes both browser report formats, drops noise and
 > other sites' pages, strips personal data from URLs and folds duplicates into counted
-> violation groups behind size and per-site rate limits. See [docs/PLAN.md](docs/PLAN.md)
+> violation groups behind size and per-site rate limits. For volume, reports can be buffered
+> in process and written in batches, or published to Kafka and written by a consumer that
+> counts each report exactly once, and hourly rollups show what is being blocked and
+> whether it is new. See [docs/PLAN.md](docs/PLAN.md)
 > for the roadmap and [docs/PROGRESS.md](docs/PROGRESS.md) for the daily log.
 
 ## Why
@@ -58,7 +61,7 @@ changes and whether the change looks like a skimmer.
 | Findings | Open, acknowledged or resolved (with a note), each step in the audit trail; `scan run --fail-on SEVERITY` gates a pipeline; `scripts diff` compares any two versions | ✅ day 5 |
 | Skimmer heuristics | Exfiltration sinks (`sendBeacon`, `fetch`, XHR, image pixels, WebSockets, `$.ajax`) and where they send, card-field and form-input collection, cookies and storage, wallet addresses and clipboard swaps, `eval` on decoded text, packers and `_0x` names, injected scripts; literals decoded (`atob`, `fromCharCode`, reversed strings) and joined before the rules run, so hidden hosts count. Verdicts combine signals and only count what a change added; a page's first scan reports a skimmer instead of baselining it; `sentinel inspect FILE` runs offline. Tested on a synthetic corpus of skimmers and benign look-alikes | ✅ day 6 |
 | CSP reports | `report-uri` and Reporting API collector: schema validation, body-size and batch limits, a per-site rate limit charged per report, CORS for the site's own origins; reports normalized (queries, referrers and `data:` bodies never stored), extension noise and foreign pages dropped, duplicates folded into fingerprinted groups with counts | ✅ day 7 |
-| High-volume ingest | Buffered batch inserts with backpressure, optional Kafka, rolling aggregates per directive and blocked host | day 8 |
+| High-volume ingest | Three modes: direct (written in the request), buffered (an in-process buffer flushed in batches, bounded, `503` with `Retry-After` when full or while the database is down) and Kafka (published with `acks=all`, applied by `sentinel csp consume` with offsets stored in the same transaction, so redelivery never double-counts). Batches merge requests into one key-ordered upsert per group, safe for concurrent writers. Hourly rollups per directive and blocked host, compared with the previous window | ✅ day 8 |
 | CSP builder | Policy suggestions from the approved inventory and observed reports | day 9 |
 | Worker and alerts | Scheduled scans, advisory locks, transactional outbox, HMAC-signed webhooks | day 10 |
 | Dynamic scripts | Optional headless-browser renderer for runtime-injected scripts | day 11 |
@@ -83,8 +86,11 @@ flowchart LR
     heur["Skimmer heuristics<br/>sinks · collection · wallets<br/>obfuscation · injection"] --> diff
     sites --> store
     browsers["Browsers<br/>report-uri · report-to"] --> csp
-    csp --> normalize["Validate · normalize<br/>rate-limit · fingerprint"] --> groups[("CSP violation groups")]
-    normalize -.-> ingest["Buffered ingest<br/>(day 8: memory or Kafka)"]
+    csp --> normalize["Validate · normalize<br/>rate-limit · fingerprint"]
+    normalize -- direct --> writer["Batch writer<br/>merge · key-ordered upserts"]
+    normalize -- buffered --> buffer["In-process buffer<br/>bounded · 503 when full"] --> writer
+    normalize -- kafka --> topic[["Kafka topic<br/>keyed by site"]] --> consumer["sentinel csp consume<br/>offsets in the same transaction"] --> writer
+    writer --> groups[("CSP violation groups<br/>+ hourly rollups")]
 ```
 
 The data model today:
@@ -111,6 +117,7 @@ erDiagram
     SCAN |o--o{ FINDING : raised
     SCRIPT_VERSION |o--o{ FINDING : "new body / previous body"
     SITE ||--o{ CSP_VIOLATION : "reports about"
+    SITE ||--o{ CSP_ROLLUP : "hourly counts"
     SITE {
         uuid id
         string name
@@ -200,6 +207,19 @@ erDiagram
         int line
         int count
         datetime last_seen_at
+    }
+    CSP_ROLLUP {
+        datetime bucket_start "UTC hour"
+        string effective_directive
+        string blocked "host, keyword or scheme"
+        enum disposition
+        int count
+    }
+    INGEST_OFFSET {
+        string consumer_group "PK with topic, partition"
+        string topic
+        int partition
+        bigint next_offset "applied up to here"
     }
     FINDING {
         string kind "script.added | script.changed | script.reformatted"
@@ -333,7 +353,37 @@ Design notes:
   (`INSERT … ON CONFLICT DO UPDATE` on PostgreSQL and SQLite), so the table grows with
   distinct problems, not traffic, and a per-site cap stops new groups past
   `SENTINEL_CSP_MAX_GROUPS_PER_SITE` while existing ones keep counting. The rate limit
-  lives in each API process; a shared limit and buffered ingest come with day 8.
+  lives in each API process.
+- **Batches, not rows.** Every ingest mode ends in the same batch writer: it merges the
+  reports of many requests in memory, so a batch costs one upsert per distinct group and
+  one per rollup key whatever the traffic. Rows are written in key order, so concurrent
+  writers queue on row locks instead of deadlocking (a load test caught direct mode
+  deadlocking on PostgreSQL before this; a regression test runs ten overlapping writers in
+  opposite orders). Timestamps are when the collector accepted a report, and the upsert
+  keeps the earliest first-seen and the latest last-seen, so a late batch from a retried
+  flush or a lagging consumer lands in the right hour and doesn't rewind anything.
+- **Backpressure instead of unbounded memory.** The buffered mode holds at most
+  `SENTINEL_CSP_BUFFER_MAX_REPORTS`; past that the collector answers `503` with
+  `Retry-After`. A failed flush puts its batch back in front of the buffer and retries
+  with exponential backoff, so a database outage fills the buffer and turns into `503`s
+  rather than lost reports or a growing heap. Shutdown asks the flusher to finish and
+  writes what is left; only a flush stuck past a timeout is cancelled, and its batch goes
+  back into the buffer for the final write. What is still in the buffer when a process is
+  killed is lost; use kafka mode if that matters.
+- **Effectively once from Kafka.** The producer uses `acks=all` with idempotence, so a
+  `202` in kafka mode means the broker has the reports. Messages are keyed by site, so a
+  site's reports stay in order on one partition. The consumer never trusts the broker's
+  committed offsets: each batch, in one transaction, locks the partitions' rows in
+  `ingest_offsets`, skips records below them, writes the rest and moves the offsets on. On
+  every partition assignment it seeks to those offsets. The broker commit afterwards only
+  saves rereading, so a crash or a failed commit means a reread, never a double count.
+  Unreadable messages are logged and skipped, with their offsets stored.
+- **Rollups that stay small.** Accepted reports are also counted per UTC hour, directive,
+  blocked host (or keyword or scheme) and disposition. Only reports that made it into a
+  group are rolled up, so the per-site group cap bounds the rollups too, and they are
+  pruned after `SENTINEL_CSP_ROLLUP_RETENTION_DAYS` (by the buffered flusher, or
+  `sentinel csp prune`). A window query compares each key with the window before it, so
+  "this host is new today" is one indexed query.
 - **Portable schema.** Enums are `VARCHAR` + `CHECK`, JSON is `JSONB` on PostgreSQL, and
   timestamps are timezone-aware UTC on both PostgreSQL and SQLite. A test asserts the ORM
   models and the hand-written migrations match. SQLite migrations run with foreign keys
@@ -790,6 +840,7 @@ $ curl -s -X POST localhost:8080/v1/reports/csp/shop -H 'content-type: applicati
 {
   "site": "shop",
   "format": "csp-report",
+  "mode": "direct",
   "received": 1,
   "accepted": 1,
   "groups_new": 1,
@@ -801,6 +852,7 @@ $ curl -s -X POST localhost:8080/v1/reports/csp/shop -H 'content-type: applicati
 {
   "site": "shop",
   "format": "reporting-api",
+  "mode": "direct",
   "received": 6,
   "accepted": 3,
   "groups_new": 2,
@@ -857,6 +909,106 @@ a body over `SENTINEL_CSP_MAX_BODY_BYTES` gets `413`, another content type `415`
 grouping (without the rate limit).
 
 (Output from a real run against PostgreSQL 16; the date and server headers are omitted.)
+
+### High-volume ingest and rolling aggregates
+
+By default the collector writes each request's reports before answering (`direct`), which
+is why the responses above can say how many groups were new. For more traffic, pick a mode
+with `SENTINEL_CSP_INGEST_MODE`:
+
+- `buffered`: reports go into an in-process buffer and the request is answered at once. A
+  background flusher writes everything waiting every `SENTINEL_CSP_FLUSH_INTERVAL_SECONDS`,
+  or as soon as `SENTINEL_CSP_FLUSH_REPORTS` are waiting. A full buffer (or a database
+  outage that keeps it full) gets `503` with `Retry-After`.
+- `kafka`: reports are published to `SENTINEL_KAFKA_TOPIC`, keyed by site, and the request
+  is answered once the broker has them. `sentinel csp consume` writes them, storing how
+  far it got in the same transaction, so a restart or a redelivered message never counts a
+  report twice. Install the extra first: `pip install 'script-sentinel[kafka]'` (or
+  `uv sync --extra kafka`).
+
+```console
+$ SENTINEL_CSP_INGEST_MODE=buffered SENTINEL_CSP_FLUSH_INTERVAL_SECONDS=5 sentinel serve --port 8080
+$ curl -s -X POST localhost:8080/v1/reports/csp/shop -H 'content-type: application/csp-report' \
+    --data-binary @examples/csp-reports/report-uri.json
+{
+  "site": "shop",
+  "format": "csp-report",
+  "mode": "buffered",
+  "received": 1,
+  "accepted": 1,
+  "groups_new": null,
+  "groups_updated": null,
+  "dropped": {}
+}
+$ curl -s localhost:8080/v1/csp/ingest
+{
+  "mode": "buffered",
+  "pending": 1,
+  "max_pending": 50000,
+  "flush_at": 1000,
+  "flush_interval_seconds": 5.0,
+  "flushes": 0,
+  "failed_flushes": 0,
+  "written": 0,
+  "dropped": {},
+  "refused": 0,
+  "last_flush_at": null,
+  "last_error": null
+}
+$ sleep 6; curl -s localhost:8080/v1/csp/ingest | jq -c '{pending, flushes, written}'
+{"pending":0,"flushes":1,"written":1}
+```
+
+Kafka mode runs the API and the consumer as separate processes:
+
+```console
+$ export SENTINEL_KAFKA_BOOTSTRAP_SERVERS=localhost:9092 SENTINEL_KAFKA_TOPIC=sentinel.csp-reports
+$ SENTINEL_CSP_INGEST_MODE=kafka sentinel serve --port 8080
+$ sentinel csp consume        # runs until SIGINT/SIGTERM; --idle-exit N for batch jobs
+```
+
+CI runs this against a real broker: it posts a payload in kafka mode, checks that
+`consume` writes it, and that a second `consume` reads nothing new.
+
+Whatever the mode, accepted reports are also counted per hour, directive and blocked host
+(or keyword), so "what is being blocked, and is it new?" is a window query. After the two
+example payloads:
+
+```console
+$ sentinel csp rollups shop
+shop: 4 reports in the last 24h (the 24h before: 0)
+  ·······················█  2026-11-27 11:00Z to 2026-11-28 11:00Z
+    count  before  directive         blocked
+        2       0  connect-src       collect.skim.test  NEW
+        1       0  script-src-elem   collect.skim.test  NEW
+        1       0  script-src-elem   inline  NEW
+$ sentinel csp rollups shop --by blocked --hours 6
+shop: 4 reports in the last 6h (the 6h before: 0)
+  ·····█  2026-11-28 05:00Z to 2026-11-28 11:00Z
+    count  before  blocked
+        3       0  collect.skim.test  NEW
+        1       0  inline  NEW
+```
+
+`NEW` means nothing like it in the window before. `GET /v1/sites/{name}/csp/rollups`
+returns the same as JSON with an hourly series, and `sentinel csp prune` deletes buckets
+past the retention.
+
+[`examples/csp_load.py`](examples/csp_load.py) sends synthetic Reporting API batches (all
+hosts on `.test`) to a running collector. One local run per mode: 2,000 requests of 20
+reports each (40,000 reports in about 6,000 groups), 32 concurrent connections, one
+uvicorn process and PostgreSQL 16 on the same 2-vCPU machine as the load generator, rate
+limit raised out of the way:
+
+| Mode | Wall time | Reports/s | Responses | Written |
+| --- | --- | --- | --- | --- |
+| `direct` | 27.0 s | 1,482 | 2,000 × `202` | 40,000 |
+| `buffered` | 12.8 s | 3,132 | 2,000 × `202` | 40,000 (23 flushes) |
+
+These are single runs on a small shared machine, so read them as the relative effect of
+batching, not as capacity numbers. The first version of this test found direct mode
+deadlocking on PostgreSQL under concurrent writes (684 of 2,000 requests failed with
+`500`); writing rows in key order fixed it.
 
 ### The API
 
@@ -945,9 +1097,11 @@ $ curl -s localhost:8080/v1/sites/demo/audit/verify | jq .
 | `POST` | `/v1/findings/{id}/reopen` | Reopen (`actor`, optional `note`); audited |
 | `GET` | `/v1/sites/{name}/scripts/{id}/diff?from=…&to=…&max_hunks=200` | Token diff between two versions (id, hex SHA-384 prefix or SRI prefix), with the signals the newer one added and the verdicts on them; defaults to the latest two |
 | `GET` | `/v1/sites/{name}/scripts/{id}/inspect?version=…` | Run the skimmer heuristics on a version (default: the latest): signals with evidence, hidden hosts, verdicts and the worst severity; read-only |
-| `POST` | `/v1/reports/csp/{name}` | Collect CSP reports (`application/csp-report` or `application/reports+json`); `202` with what was counted and dropped, `413`, `415`, `400`, or `429` with `Retry-After`. `OPTIONS` answers CORS preflights for the site's own origins |
+| `POST` | `/v1/reports/csp/{name}` | Collect CSP reports (`application/csp-report` or `application/reports+json`); `202` with what was counted (or queued, in buffered and kafka modes) and dropped, `413`, `415`, `400`, `429` with `Retry-After`, or `503` with `Retry-After` when the buffer or the queue can't take them. `OPTIONS` answers CORS preflights for the site's own origins |
 | `GET` | `/v1/sites/{name}/csp/violations?directive=…&disposition=…&blocked_host=…&since=…&order=last_seen\|count&limit=50` | Violation groups with totals |
 | `GET` | `/v1/sites/{name}/csp/violations/{id}` | One group, with the violated policy |
+| `GET` | `/v1/sites/{name}/csp/rollups?by=both\|directive\|blocked&hours=24&directive=…&disposition=…&limit=20` | Accepted reports over the last `hours` UTC hours by key, each with its count in the window before and a `new` flag, plus an hourly series |
+| `GET` | `/v1/csp/ingest` | This process's ingest mode; for buffered: pending, flushes, written, dropped, refused, last error; for kafka: messages and reports published, failures |
 
 `PATCH /v1/sites/{name}` also accepts `respect_robots`. The `actor` on authorization and
 finding requests is recorded as given: the API has no authentication yet (day 13 adds it),
@@ -972,6 +1126,15 @@ for now; scheduled background scans arrive with the worker on day 10.
 | `SENTINEL_CSP_REPORTS_PER_MINUTE` | `600` | Sustained reports accepted per site per minute, per API process |
 | `SENTINEL_CSP_BURST` | `300` | Reports a site may send at once; at least the batch limit |
 | `SENTINEL_CSP_MAX_GROUPS_PER_SITE` | `10000` | Distinct violation groups kept per site; new ones beyond it are dropped as `group_limit` |
+| `SENTINEL_CSP_INGEST_MODE` | `direct` | `direct` (write in the request), `buffered` (in-process buffer, batched) or `kafka` (publish; `sentinel csp consume` writes) |
+| `SENTINEL_CSP_BUFFER_MAX_REPORTS` | `50000` | Reports the buffer holds before the collector answers `503` |
+| `SENTINEL_CSP_FLUSH_REPORTS` | `1000` | Flush as soon as this many reports are waiting |
+| `SENTINEL_CSP_FLUSH_INTERVAL_SECONDS` | `1.0` | Flush at least this often (doubled per failed flush, up to 60 s) |
+| `SENTINEL_CSP_ROLLUP_RETENTION_DAYS` | `62` | Hourly rollups older than this are pruned; comparing a window with the one before needs twice the window |
+| `SENTINEL_KAFKA_BOOTSTRAP_SERVERS` | none | `host:port[,host:port…]`; required in kafka mode and for `sentinel csp consume` |
+| `SENTINEL_KAFKA_TOPIC` | `sentinel.csp-reports` | Topic for the report queue |
+| `SENTINEL_KAFKA_CONSUMER_GROUP` | `script-sentinel` | Consumer group, and the key the applied offsets are stored under |
+| `SENTINEL_KAFKA_SEND_TIMEOUT_SECONDS` | `5` | How long a request waits for the broker before `503` |
 | `SENTINEL_ACTOR` | login name | Who the CLI records in the audit trail (`--actor` overrides it) |
 
 The default URL's credentials are local-development placeholders; set your own in production.
@@ -984,13 +1147,15 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy
 uv run pytest --cov
 
-# Also run the suite against PostgreSQL:
+# Also run the suite against PostgreSQL, and the Kafka adapters against a broker:
 export SENTINEL_TEST_DATABASE_URL=postgresql+asyncpg://sentinel:sentinel@localhost:5432/sentinel
+export SENTINEL_TEST_KAFKA_BOOTSTRAP=localhost:9092
 uv run pytest
 ```
 
-CI runs the same checks on Python 3.12 and 3.13 against SQLite and PostgreSQL 16, builds the
-package, smoke-tests the CLI and API against PostgreSQL, and scans the fixture site.
+CI runs the same checks on Python 3.12 and 3.13 against SQLite, PostgreSQL 16 and a
+single-node Kafka 3.9 broker, builds the package, smoke-tests the CLI and API against
+PostgreSQL, the buffered and kafka ingest modes, and scans the fixture site.
 
 Scanner tests run against two real HTTP servers on `127.0.0.1` (the shop and a vendor CDN on
 another origin) whose pages and scripts the tests change mid-run, plus `httpx.MockTransport`
@@ -1006,7 +1171,16 @@ checks for a `script.suspicious` finding with the hidden host, and runs `sentine
 on the heuristics corpus (a skimmer fails `--fail-on high`, the PSP library given its own
 host passes). The API smoke test posts both example CSP payloads and checks the grouping,
 the drop reasons, that no query string was stored, the preflight for an allowed and a
-foreign origin, `413` and `415`, and a replay through `sentinel csp ingest`.
+foreign origin, `413` and `415`, and a replay through `sentinel csp ingest`. The ingest
+smoke test sends 10,000 reports from `examples/csp_load.py` to a buffered collector and
+checks that every one was written and rolled up, then posts a payload in kafka mode and
+checks that `sentinel csp consume` writes it once and a second run reads nothing.
+
+The ingest tests use an in-memory broker for the consumer's offset handling (redelivery
+after a failed broker commit, a batch that fails to apply, unreadable messages, separate
+consumer groups) and a stand-in for aiokafka to check what the adapters ask of it; the
+real broker test checks a round trip and that a consumer whose broker-side offsets are
+gone still starts where the database says.
 
 ## Project layout
 
@@ -1036,13 +1210,18 @@ src/script_sentinel/
   authorization.py  decisions, policies and the rules that derive each script's status
   audit.py          the hash-chained, append-only authorization audit trail
   csp_reports.py    CSP report schemas, normalization, drop reasons and fingerprints
-  violations.py     folding reports into violation groups (upserts) and listing them
+  violations.py     the batch writer (violation groups and hourly rollups), listing,
+                    rolling-window queries and pruning
+  ingest.py         ingest modes: buffered sink, queue sink, the effectively-once consumer,
+                    message format, in-memory broker
+  kafka.py          aiokafka publisher and subscriber (optional dependency)
   ratelimit.py      per-site token bucket for the report collector
 examples/
   serve.py          serves the fixture shop and its CDN on two local origins
   fixture-site/     synthetic shop for the quick start and CI
   fixture-cdn/      the "third-party" scripts it loads
   csp-reports/      synthetic report-uri and Reporting API payloads
+  csp_load.py       load generator for the report collector
 tests/              pytest suite (SQLite always, PostgreSQL when configured)
   fixtures/heuristics/  synthetic skimmer and benign corpus with expected verdicts
 docs/               PLAN.md and PROGRESS.md
