@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import getpass
 import json
+import signal as os_signal
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -53,11 +56,13 @@ from script_sentinel.db.models import (
     Severity,
     SnapshotOutcome,
     SriStatus,
+    utcnow,
 )
 from script_sentinel.diff import Hunk, render_hunks
 from script_sentinel.diff import render as render_diff
 from script_sentinel.fetch import PageFetcher
 from script_sentinel.headers import describe as describe_headers
+from script_sentinel.ingest import ConsumeStats, ReportConsumer, Subscriber
 
 app = typer.Typer(
     help="script-sentinel: integrity monitoring for the third-party scripts your pages load.",
@@ -88,7 +93,8 @@ findings_app = typer.Typer(
 )
 app.add_typer(findings_app, name="findings")
 csp_app = typer.Typer(
-    help="Load CSP violation reports and review the violation groups they form.",
+    help="Load CSP violation reports, review the groups they form and their rolling "
+    "aggregates, and run the Kafka consumer.",
     no_args_is_help=True,
 )
 app.add_typer(csp_app, name="csp")
@@ -1838,3 +1844,176 @@ def csp_show(
     )
     if group.original_policy:
         typer.echo(f"  policy:      {group.original_policy}")
+
+
+_SPARKS = "·▁▂▃▄▅▆▇█"
+
+
+def _sparkline(counts: Sequence[int]) -> str:
+    top = max(counts, default=0)
+    if top == 0:
+        return _SPARKS[0] * len(counts)
+    return "".join(_SPARKS[0 if c == 0 else max(1, round(c / top * 8))] for c in counts)
+
+
+@csp_app.command("rollups")
+def csp_rollups(
+    site: str,
+    by: Annotated[
+        violations.RollupDimension,
+        typer.Option(help="directive, blocked or both.", case_sensitive=False),
+    ] = violations.RollupDimension.BOTH,
+    hours: Annotated[
+        int,
+        typer.Option(
+            min=1, max=violations.MAX_WINDOW_HOURS, help="Window in UTC hours (incl. this one)."
+        ),
+    ] = 24,
+    directive: Annotated[str | None, typer.Option(help="Only this directive.")] = None,
+    disposition: Annotated[
+        CspDisposition | None,
+        typer.Option(help="enforce, report or unknown.", case_sensitive=False),
+    ] = None,
+    limit: Annotated[int, typer.Option(min=1, max=500, help="How many rows.")] = 20,
+    as_json: JsonOutput = False,
+    url: DatabaseURL = None,
+) -> None:
+    """What is being blocked over a rolling window, compared with the window before."""
+
+    async def work(session: AsyncSession) -> violations.RollupReport:
+        return await violations.rollup(
+            session,
+            site,
+            by=by,
+            hours=hours,
+            directive=directive,
+            disposition=disposition,
+            limit=limit,
+        )
+
+    report = _run(url, work)
+    if as_json:
+        typer.echo(json.dumps(report.to_dict(), indent=2))
+        return
+    typer.echo(
+        f"{site}: {report.total} reports in the last {hours}h "
+        f"(the {hours}h before: {report.previous_total})"
+    )
+    typer.echo(
+        f"  {_sparkline([c for _, c in report.buckets])}  "
+        f"{report.window_start:%Y-%m-%d %H:00}Z to {report.window_end:%Y-%m-%d %H:00}Z"
+    )
+    if not report.rows:
+        return
+    labels = {
+        violations.RollupDimension.DIRECTIVE: "directive",
+        violations.RollupDimension.BLOCKED: "blocked",
+        violations.RollupDimension.BOTH: f"{'directive':<16}  blocked",
+    }
+    typer.echo(f"  {'count':>7} {'before':>7}  {labels[by]}")
+    for row in report.rows:
+        key = "  ".join(
+            part
+            for part in (
+                f"{row.directive:<16}" if row.directive is not None else None,
+                row.blocked,
+            )
+            if part is not None
+        ).rstrip()
+        typer.echo(f"  {row.count:>7} {row.previous:>7}  {key}" + ("  NEW" if row.new else ""))
+
+
+@csp_app.command("prune")
+def csp_prune(
+    days: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="Keep this many days of rollups. Defaults to SENTINEL_CSP_ROLLUP_RETENTION_DAYS.",
+        ),
+    ] = None,
+    url: DatabaseURL = None,
+) -> None:
+    """Delete hourly rollups older than the retention period."""
+    keep = days or Settings().csp_rollup_retention_days
+
+    async def work(session: AsyncSession) -> int:
+        return await violations.prune_rollups(
+            session, before=violations.hour_bucket(utcnow()) - timedelta(days=keep)
+        )
+
+    deleted = _run(url, work)
+    typer.echo(f"deleted {deleted} rollup buckets older than {keep} days")
+
+
+def _subscriber(settings: Settings) -> Subscriber:  # pragma: no cover - needs a broker
+    from script_sentinel.kafka import AioKafkaSubscriber
+
+    assert settings.kafka_bootstrap_servers is not None
+    return AioKafkaSubscriber(
+        settings.kafka_bootstrap_servers,
+        settings.kafka_topic,
+        group_id=settings.kafka_consumer_group,
+    )
+
+
+@csp_app.command("consume")
+def csp_consume(
+    idle_exit: Annotated[
+        float | None,
+        typer.Option(
+            "--idle-exit",
+            min=0,
+            help="Stop once nothing has arrived for this many seconds (batch jobs, tests). "
+            "Without it, runs until interrupted.",
+        ),
+    ] = None,
+    batch: Annotated[int, typer.Option(min=1, max=100_000, help="Records per batch.")] = 1000,
+    as_json: JsonOutput = False,
+    url: DatabaseURL = None,
+) -> None:
+    """Apply CSP reports from Kafka to the database (SENTINEL_CSP_INGEST_MODE=kafka).
+
+    Each batch and the offsets it reaches are written in one transaction, so restarting or
+    a redelivered message never counts a report twice.
+    """
+    settings = Settings()
+    if not settings.kafka_bootstrap_servers:
+        typer.secho("error: set SENTINEL_KAFKA_BOOTSTRAP_SERVERS", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    subscriber = _subscriber(settings)
+
+    async def main() -> ConsumeStats:
+        engine = make_engine(_url(url), pool_pre_ping=True)
+        consumer = ReportConsumer(
+            subscriber,
+            make_sessionmaker(engine),
+            group=settings.kafka_consumer_group,
+            max_groups=settings.csp_max_groups_per_site,
+            batch_size=batch,
+        )
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (os_signal.SIGINT, os_signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError, RuntimeError):
+                loop.add_signal_handler(sig, stop.set)
+        try:
+            await consumer.start()
+            return await consumer.run(idle_exit=idle_exit, stop=stop)
+        finally:
+            for sig in (os_signal.SIGINT, os_signal.SIGTERM):
+                with contextlib.suppress(NotImplementedError, RuntimeError):
+                    loop.remove_signal_handler(sig)
+            await consumer.close()
+            await engine.dispose()
+
+    stats = asyncio.run(main())
+    if as_json:
+        typer.echo(json.dumps(stats.to_dict(), indent=2))
+        return
+    dropped = ", ".join(f"{k} {v}" for k, v in stats.dropped.items())
+    typer.echo(
+        f"{stats.messages} messages in {stats.batches} batches: {stats.written} reports "
+        f"written, {stats.duplicates} duplicates skipped, {stats.poison} unreadable"
+        + (f", dropped: {dropped}" if dropped else "")
+    )

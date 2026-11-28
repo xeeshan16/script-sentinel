@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from script_sentinel import sites, violations
 from script_sentinel.api.schemas import (
     CspIngestOut,
+    CspRollupOut,
     CspViolationDetail,
     CspViolationList,
     CspViolationOut,
@@ -32,7 +33,8 @@ from script_sentinel.csp_reports import (
     UnsupportedContentTypeError,
     parse_payload,
 )
-from script_sentinel.db.models import CspDisposition, Site
+from script_sentinel.db.models import CspDisposition, Site, utcnow
+from script_sentinel.ingest import IngestUnavailableError, ReportSink
 from script_sentinel.origins import InvalidUrlError, parse_origin
 from script_sentinel.ratelimit import RateLimiter, retry_after
 
@@ -41,7 +43,7 @@ router = APIRouter(tags=["csp"])
 REPORT_PATH = "/v1/reports/csp/{name}"
 
 _COLLECT_ERRORS: dict[int | str, dict[str, object]] = {
-    code: {"model": ErrorOut} for code in (400, 404, 413, 415, 429)
+    code: {"model": ErrorOut} for code in (400, 404, 413, 415, 429, 503)
 }
 _ERRORS: dict[int | str, dict[str, object]] = {404: {"model": ErrorOut}, 422: {"model": ErrorOut}}
 
@@ -120,7 +122,8 @@ async def collect(
     Answers ``202`` with what was counted and why the rest was dropped. ``429`` with
     ``Retry-After`` when the site is over its rate limit (nothing is recorded), ``413``
     for a body over the size limit, ``415`` for another content type, ``400`` for a body
-    that isn't a report payload.
+    that isn't a report payload. ``503`` with ``Retry-After`` when the buffer or the queue
+    can't take the reports (buffered and kafka modes).
     """
     site = await sites.get_site(session, name)
     cors = _cors(request, site)
@@ -155,7 +158,19 @@ async def collect(
         error.headers = {**cors, **(error.headers or {})}
         raise error
     assert parsed is not None
-    result = await violations.ingest(session, site, parsed, limits=limits)
+    sink: ReportSink | None = request.app.state.csp_sink
+    if sink is None:
+        result = await violations.ingest(session, site, parsed, limits=limits)
+    else:
+        try:
+            await sink.submit(violations.Pending(site.id, utcnow(), parsed.violations))
+        except IngestUnavailableError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                str(exc),
+                headers={**cors, "Retry-After": retry_after(exc.retry_after)},
+            ) from exc
+        result = violations.queued(site, parsed, mode=sink.mode.value)
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
         content=CspIngestOut.model_validate(result.to_dict()).model_dump(mode="json"),
@@ -200,3 +215,35 @@ async def get_violation(name: str, violation_id: uuid.UUID, session: Session) ->
     return CspViolationDetail(
         **CspViolationOut.of(group).model_dump(), original_policy=group.original_policy
     )
+
+
+@router.get("/v1/sites/{name}/csp/rollups", responses=_ERRORS)
+async def get_rollups(
+    name: str,
+    session: Session,
+    by: violations.RollupDimension = violations.RollupDimension.BOTH,
+    hours: Annotated[int, Query(ge=1, le=violations.MAX_WINDOW_HOURS)] = 24,
+    directive: Annotated[str | None, Query(max_length=64)] = None,
+    disposition: CspDisposition | None = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 20,
+) -> CspRollupOut:
+    """Accepted reports over the last ``hours`` UTC hours by directive, blocked host (or
+    keyword) or both, each with its count in the window before, plus an hourly series."""
+    report = await violations.rollup(
+        session,
+        name,
+        by=by,
+        hours=hours,
+        directive=directive,
+        disposition=disposition,
+        limit=limit,
+    )
+    return CspRollupOut.model_validate(report.to_dict())
+
+
+@router.get("/v1/csp/ingest", tags=["csp"])
+async def ingest_status(request: Request) -> dict[str, object]:
+    """How this process hands reports to the database: the mode, and for buffered and
+    kafka modes what is waiting, what was written or published, and the last error."""
+    sink: ReportSink | None = request.app.state.csp_sink
+    return {"mode": "direct"} if sink is None else sink.status()

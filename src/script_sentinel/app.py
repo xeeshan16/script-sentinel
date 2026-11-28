@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 import httpx
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from script_sentinel import __version__
 from script_sentinel.api import authorization as authorization_api
@@ -19,6 +21,7 @@ from script_sentinel.api import sites as sites_api
 from script_sentinel.config import Settings
 from script_sentinel.db import make_engine, make_sessionmaker
 from script_sentinel.fetch import PageFetcher
+from script_sentinel.ingest import BufferedSink, Publisher, QueueSink, ReportSink
 from script_sentinel.ratelimit import RateLimiter
 from script_sentinel.sites import ConflictError, NotFoundError, SiteError, ValidationError
 
@@ -29,10 +32,44 @@ _STATUS: dict[type[SiteError], int] = {
 }
 
 
+def make_sink(
+    settings: Settings,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    publisher: Publisher | None = None,
+) -> ReportSink | None:
+    """The sink for the configured ingest mode; ``None`` for direct writes."""
+    if settings.csp_ingest_mode == "buffered":
+        return BufferedSink(
+            sessionmaker,
+            max_groups=settings.csp_max_groups_per_site,
+            max_pending=settings.csp_buffer_max_reports,
+            flush_at=settings.csp_flush_reports,
+            flush_interval=settings.csp_flush_interval_seconds,
+            retention=timedelta(days=settings.csp_rollup_retention_days),
+        )
+    if settings.csp_ingest_mode == "kafka":
+        if publisher is None:
+            from script_sentinel.kafka import AioKafkaPublisher
+
+            assert settings.kafka_bootstrap_servers is not None  # checked by Settings
+            publisher = AioKafkaPublisher(
+                settings.kafka_bootstrap_servers,
+                settings.kafka_topic,
+                send_timeout=settings.kafka_send_timeout_seconds,
+            )
+        return QueueSink(publisher, retry_after=settings.kafka_send_timeout_seconds)
+    return None
+
+
 def create_app(
-    settings: Settings | None = None, *, transport: httpx.AsyncBaseTransport | None = None
+    settings: Settings | None = None,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    publisher: Publisher | None = None,
 ) -> FastAPI:
-    """Build the app. ``transport`` replaces the network for page fetches (tests)."""
+    """Build the app. ``transport`` replaces the network for page fetches and
+    ``publisher`` the Kafka producer in kafka mode (tests)."""
     settings = settings or Settings()
     limits = settings.fetch_limits()
 
@@ -41,9 +78,16 @@ def create_app(
         engine = make_engine(settings.database_url, pool_pre_ping=True)
         app.state.engine = engine
         app.state.sessionmaker = make_sessionmaker(engine)
+        sink = make_sink(settings, app.state.sessionmaker, publisher=publisher)
+        app.state.csp_sink = sink
         try:
+            if sink is not None:
+                await sink.start()
             yield
         finally:
+            # Flush or close the sink while the database is still there.
+            if sink is not None:
+                await sink.close()
             await engine.dispose()
 
     app = FastAPI(

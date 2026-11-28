@@ -22,6 +22,12 @@
 * A **CSP violation** is one group of Content-Security-Policy violation reports browsers
   sent about a site's pages: the same page, directive, blocked resource, source location
   and disposition, with how often it was reported and when (see csp_reports.py).
+* A **CSP rollup** counts a site's accepted violation reports per hour, directive, blocked
+  host (or keyword) and disposition, so "what is being blocked, and is it new" is a cheap
+  query over a rolling window instead of a scan of the groups.
+* An **ingest offset** is how far the Kafka consumer has applied a partition of the report
+  topic. It is written in the same transaction as the counts, so a redelivered message is
+  recognised and not counted twice.
 * A **scan** is one pass over a site's pages. Each page it fetched gets a **page
   snapshot** (what happened and when), and each script found on that page gets a **script
   observation** with the attributes it had at that moment. Snapshots are kept even after a
@@ -38,6 +44,7 @@ from typing import Any, ClassVar
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -664,6 +671,51 @@ class CspViolation(Base):
     count: Mapped[int] = mapped_column(Integer, default=1)
     first_seen_at: Mapped[datetime] = mapped_column(default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class CspRollup(Base):
+    """Accepted CSP reports per hour bucket, directive, blocked key and disposition.
+
+    ``blocked`` is the blocked host for URLs and the keyword or scheme otherwise
+    (``inline``, ``eval``, ``data:``), so the table grows with distinct problems per hour,
+    not with traffic. Only reports counted towards a group are rolled up, which keeps it
+    bounded by the per-site group cap as well.
+    """
+
+    __tablename__ = "csp_rollups"
+    __table_args__ = (
+        UniqueConstraint(
+            "site_id",
+            "bucket_start",
+            "effective_directive",
+            "blocked",
+            "disposition",
+            name="uq_csp_rollups_bucket_key",
+        ),
+        Index("ix_csp_rollups_bucket_start", "bucket_start"),
+        CheckConstraint("count >= 1", name="ck_csp_rollups_count"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    site_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"))
+    bucket_start: Mapped[datetime]
+    effective_directive: Mapped[str] = mapped_column(String(64))
+    blocked: Mapped[str] = mapped_column(String(255))
+    disposition: Mapped[CspDisposition] = mapped_column(_enum(CspDisposition, "csp_disposition"))
+    count: Mapped[int] = mapped_column(Integer)
+
+
+class IngestOffset(Base):
+    """The next offset to apply for one partition of a topic, per consumer group."""
+
+    __tablename__ = "ingest_offsets"
+    __table_args__ = (CheckConstraint("next_offset >= 0", name="ck_ingest_offsets_next_offset"),)
+
+    consumer_group: Mapped[str] = mapped_column(String(128), primary_key=True)
+    topic: Mapped[str] = mapped_column(String(249), primary_key=True)
+    partition: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    next_offset: Mapped[int] = mapped_column(BigInteger)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
 
 def sri_from_sha384_hex(hex_digest: str) -> str:

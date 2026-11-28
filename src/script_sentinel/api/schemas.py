@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -561,15 +561,49 @@ class DiffOut(BaseModel):
 class CspIngestOut(BaseModel):
     site: str
     format: CspReportFormat
+    mode: Literal["direct", "buffered", "kafka"] = Field(
+        description="direct: written before answering. buffered or kafka: queued, and "
+        "written by a background flusher or the Kafka consumer."
+    )
     received: int = Field(description="Reports in the payload.")
-    accepted: int = Field(description="Reports counted towards a violation group.")
-    groups_new: int
-    groups_updated: int
+    accepted: int = Field(
+        description="Reports counted towards a violation group (direct) or queued to be."
+    )
+    groups_new: int | None = Field(description="null when queued; known once written.")
+    groups_updated: int | None = Field(description="null when queued; known once written.")
     dropped: dict[str, int] = Field(
         description="Reports not counted, by reason: invalid, not_csp, foreign_document, "
         "extension, batch_limit, group_limit.",
         examples=[{"extension": 1, "not_csp": 2}],
     )
+
+
+class CspRollupRowOut(BaseModel):
+    directive: str | None = Field(description="null when grouped by blocked only.")
+    blocked: str | None = Field(
+        description="The blocked host, or the keyword or scheme (inline, eval, data:); "
+        "null when grouped by directive only."
+    )
+    count: int = Field(description="Accepted reports in the window.")
+    previous: int = Field(description="Accepted reports in the window before it.")
+    new: bool = Field(description="Nothing like it in the previous window.")
+
+
+class CspRollupBucketOut(BaseModel):
+    hour: datetime
+    count: int
+
+
+class CspRollupOut(BaseModel):
+    site: str
+    by: Literal["directive", "blocked", "both"]
+    hours: int
+    window_start: datetime
+    window_end: datetime
+    total: int
+    previous_total: int
+    rows: list[CspRollupRowOut]
+    buckets: list[CspRollupBucketOut]
 
 
 class CspViolationOut(BaseModel):

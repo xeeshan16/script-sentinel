@@ -96,13 +96,65 @@ class Settings(BaseSettings):
         description="Distinct violation groups kept per site; new ones beyond it are dropped.",
     )
 
+    csp_ingest_mode: Literal["direct", "buffered", "kafka"] = Field(
+        default="direct",
+        description="direct: write reports inside the request. buffered: an in-process "
+        "buffer flushed in batches. kafka: publish to a topic for `sentinel csp consume`.",
+    )
+    csp_buffer_max_reports: int = Field(
+        default=50_000,
+        ge=1,
+        le=10_000_000,
+        description="Reports the buffer holds before the collector answers 503 (buffered).",
+    )
+    csp_flush_reports: int = Field(
+        default=1_000,
+        ge=1,
+        le=1_000_000,
+        description="Flush as soon as this many reports are waiting (buffered).",
+    )
+    csp_flush_interval_seconds: float = Field(
+        default=1.0, gt=0, le=60, description="Flush at least this often (buffered)."
+    )
+    csp_rollup_retention_days: int = Field(
+        default=62,
+        ge=1,
+        le=3650,
+        description="Hourly rollups older than this are pruned. Comparing a window with "
+        "the one before it needs twice the window.",
+    )
+    kafka_bootstrap_servers: str | None = Field(
+        default=None, description="Comma-separated host:port list (kafka mode)."
+    )
+    kafka_topic: str = Field(
+        default="sentinel.csp-reports",
+        pattern=r"^[A-Za-z0-9._-]{1,249}$",
+        description="Topic the collector publishes reports to.",
+    )
+    kafka_consumer_group: str = Field(default="script-sentinel", min_length=1, max_length=128)
+    kafka_send_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=60,
+        description="How long a request waits for the broker before answering 503.",
+    )
+
     @model_validator(mode="after")
-    def _burst_covers_a_batch(self) -> Settings:
+    def _consistent(self) -> Settings:
         if self.csp_burst < self.csp_max_reports_per_request:
             raise ValueError(
                 "csp_burst must be at least csp_max_reports_per_request, or a full batch "
                 "could never be accepted"
             )
+        if self.csp_buffer_max_reports < max(
+            self.csp_flush_reports, self.csp_max_reports_per_request
+        ):
+            raise ValueError(
+                "csp_buffer_max_reports must be at least csp_flush_reports and "
+                "csp_max_reports_per_request"
+            )
+        if self.csp_ingest_mode == "kafka" and not self.kafka_bootstrap_servers:
+            raise ValueError("csp_ingest_mode=kafka needs kafka_bootstrap_servers")
         return self
 
     def ingest_limits(self) -> IngestLimits:

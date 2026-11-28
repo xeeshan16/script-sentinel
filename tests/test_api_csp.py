@@ -70,6 +70,7 @@ def test_the_example_payloads_are_collected_and_grouped(client: TestClient) -> N
     assert legacy.json() == {
         "site": "shop",
         "format": "csp-report",
+        "mode": "direct",
         "received": 1,
         "accepted": 1,
         "groups_new": 1,

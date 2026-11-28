@@ -33,8 +33,14 @@ dependencies = [
 [project.scripts]
 sentinel = "script_sentinel.cli:app"
 
+[project.optional-dependencies]
+kafka = [
+    "aiokafka>=0.12",
+]
+
 [dependency-groups]
 dev = [
+    "aiokafka>=0.12",
     "aiosqlite>=0.20",
     "mypy>=1.13",
     "pytest>=8.3",
@@ -68,6 +74,11 @@ python_version = "3.12"
 files = ["src", "tests", "examples"]
 plugins = ["pydantic.mypy"]
 
+[[tool.mypy.overrides]]
+# aiokafka ships no type information.
+module = ["aiokafka", "aiokafka.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
@@ -78,7 +89,10 @@ filterwarnings = [
     # Starlette's TestClient announces a future switch away from httpx.
     "ignore:Using `httpx` with `starlette.testclient`",
 ]
-markers = ["postgres: integration test against PostgreSQL (needs SENTINEL_TEST_DATABASE_URL)"]
+markers = [
+    "postgres: integration test against PostgreSQL (needs SENTINEL_TEST_DATABASE_URL)",
+    "kafka: integration test against a Kafka broker (needs SENTINEL_TEST_KAFKA_BOOTSTRAP)",
+]
 
 [tool.coverage.run]
 source = ["script_sentinel"]
